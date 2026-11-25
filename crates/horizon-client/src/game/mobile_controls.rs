@@ -251,8 +251,8 @@ impl Game<'_> {
             .as_ref()
             .is_some_and(|p| p.flying || p.swimming || p.spectator)
             || self.riding.is_some();
-        let zoom_available = self.mod_key_ready(super::mod_keys::ZOOM.mod_id);
-        let waypoints_available = self.mod_key_ready(super::mod_keys::WAYPOINTS.mod_id);
+        let zoom_available = self.mobile.controls.zoom_available;
+        let waypoints_available = self.mobile.controls.waypoints_available;
         let voice_available = self.voice.enabled();
         self.mobile.classic_pe.layout_options(
             vertical,
@@ -310,7 +310,11 @@ impl Game<'_> {
                 .as_ref()
                 .is_some_and(|p| p.flying || p.swimming || p.spectator)
                 || self.riding.is_some();
+            let zoom_mod = self.mod_key_ready(super::mod_keys::ZOOM.mod_id);
+            let waypoint_mod = self.mod_key_ready(super::mod_keys::WAYPOINTS.mod_id);
             let tc = &mut self.mobile.controls;
+            tc.zoom_available = zoom_mod;
+            tc.waypoints_available = waypoint_mod;
             tc.in_menu = in_menu;
             tc.in_inventory = matches!(self.screen, Screen::Inventory | Screen::Creative);
             if !tc.in_inventory {
