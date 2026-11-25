@@ -20,6 +20,8 @@ mod mobile_platform;
 #[derive(Default)]
 pub(super) struct MobileControls {
     pub controls: horizon_client::android_controls::TouchControls,
+    pub classic_pe: horizon_client::classic_pe_touch::ClassicPeState,
+    classic_pe_sneaking: bool,
     pub keypad: horizon_client::keypad::Keypad,
     pub ui: horizon_client::android_control_ui::TouchUi,
     custom_keys: std::collections::HashSet<KeyCode>,
@@ -31,6 +33,12 @@ pub(super) struct MobileControls {
     pub loaded: bool,
     frame_at: Option<Instant>,
     was_in_menu: Option<bool>,
+}
+
+impl MobileControls {
+    pub(super) fn is_classic_pe(&self) -> bool {
+        self.controls.settings.control_style == horizon_client::android_controls::ControlStyle::Mcpe
+    }
 }
 
 impl Game<'_> {
@@ -145,6 +153,12 @@ impl Game<'_> {
                 }
                 return true;
             }
+            if self.mobile.is_classic_pe() && self.mobile.classic_pe.editor.active {
+                self.mobile
+                    .classic_pe
+                    .close_editor(&horizon_client::logging::game_home());
+                return true;
+            }
             if self.mobile.controls.editor.is_some() {
                 self.mobile.controls.request_editor_back();
                 return true;
@@ -207,6 +221,9 @@ impl Game<'_> {
             horizon_client::android_control_theme::set_android_dpi(w.scale_factor() as f32);
         }
         self.mobile.controls.settings = self.settings.touch.clone();
+        self.mobile
+            .classic_pe
+            .ensure_loaded(&horizon_client::logging::game_home());
         self.settings.touch.virtual_mouse_hidden = true;
         self.mobile.controls.settings.virtual_mouse_hidden = true;
         self.mobile.ui.menu_direct_pointer = true;
@@ -221,8 +238,31 @@ impl Game<'_> {
     pub(in crate::game) fn mobile_open_editor(&mut self) {
         self.mobile_init();
         self.android_release_touch_keys(true);
-        self.mobile.controls.open_editor();
+        if self.mobile.is_classic_pe() {
+            self.mobile.classic_pe.open_editor();
+        } else {
+            self.mobile.controls.open_editor();
+        }
         self.capture(false);
+    }
+    fn classic_pe_layout_options(&self) -> horizon_client::classic_pe_touch::LayoutOptions {
+        let vertical = self
+            .player
+            .as_ref()
+            .is_some_and(|p| p.flying || p.swimming || p.spectator)
+            || self.riding.is_some();
+        let zoom_available = self.mod_key_ready(super::mod_keys::ZOOM.mod_id);
+        let waypoints_available = self.mod_key_ready(super::mod_keys::WAYPOINTS.mod_id);
+        let voice_available = self.voice.enabled();
+        self.mobile.classic_pe.layout_options(
+            vertical,
+            zoom_available,
+            waypoints_available,
+            voice_available,
+        )
+    }
+    fn classic_pe_active(&self) -> bool {
+        self.mobile.is_classic_pe() && !self.settings.keypad.enabled
     }
     pub(in crate::game) fn mobile_frame(&mut self, events: &dyn super::event_loop::EventLoopCtl) {
         self.mobile_init();
@@ -256,6 +296,76 @@ impl Game<'_> {
             self.pad.set_touch_state(Default::default());
         }
         let shown = self.touch_shown() || self.settings.keypad.enabled;
+        if self.classic_pe_active() {
+            let item_use = self.mobile_hold_uses_item();
+            let entity_use = self.touch_entity_accepts_use();
+            let shield_available = self
+                .held()
+                .into_iter()
+                .chain(self.offhand.as_ref())
+                .any(|s| self.blocks_attacks(s).is_some());
+            let breaking = self.touch_mining_progress();
+            let vertical = self
+                .player
+                .as_ref()
+                .is_some_and(|p| p.flying || p.swimming || p.spectator)
+                || self.riding.is_some();
+            let tc = &mut self.mobile.controls;
+            tc.in_menu = in_menu;
+            tc.in_inventory = matches!(self.screen, Screen::Inventory | Screen::Creative);
+            if !tc.in_inventory {
+                tc.inventory_shift = false;
+            }
+            tc.viewport(
+                self.window.as_ref().map_or(1, |w| w.inner_size().width),
+                self.window.as_ref().map_or(1, |w| w.inner_size().height),
+            );
+            tc.set_vertical_movement(self.player.as_ref().is_some_and(|p| p.flying));
+            tc.update_visibility(shown, dt);
+            let size = self
+                .gui_scale()
+                .map_or((427.0, 240.0), |b| (b.width, b.height));
+            let upd = self.mobile.classic_pe.frame_update(
+                size,
+                breaking,
+                vertical,
+                item_use,
+                entity_use,
+                shield_available,
+                in_menu || self.mobile.ui.floating_menu,
+                self.focused,
+            );
+            self.mobile.touch_aim = upd.aim_norm;
+            self.mobile.touch_shield =
+                shown && !in_menu && shield_available && upd.sneaking && !vertical;
+            let lost = upd.sneaking && !self.keys.contains(&KeyCode::ShiftLeft);
+            if upd.sneaking != self.mobile.classic_pe_sneaking || lost {
+                let pressed = upd.sneaking && !self.mobile.classic_pe_sneaking;
+                self.mobile.classic_pe_sneaking = upd.sneaking;
+                self.sync_toggle(0);
+                if pressed {
+                    let _ = self.key_pressed(KeyCode::ShiftLeft);
+                }
+            }
+            self.pad.set_touch_state(upd.pad);
+            self.mod_key_hold(
+                "touch",
+                &super::mod_keys::ZOOM,
+                upd.zoom_active && !in_menu && !self.mobile.ui.floating_menu && self.focused,
+            );
+            self.android_custom_events();
+            self.android_virtual_mouse_clicks(events);
+            let ticking = self.title.is_none() && self.screen == Screen::Playing && !self.pause;
+            for token in std::mem::take(&mut self.mobile.late_custom_releases) {
+                if !ticking || self.mobile.custom_pressed_at.get(&token) != Some(&self.ticks) {
+                    self.android_dispatch_custom_token(&token, false);
+                } else {
+                    self.mobile.late_custom_releases.push(token);
+                }
+            }
+            self.touch_gyro();
+            return;
+        }
         let context_use = self.touch_context_use();
         let rocket_boost = self.mobile_rocket_boost();
         let item_use = self.mobile_hold_uses_item();
@@ -388,20 +498,50 @@ impl Game<'_> {
     }
     pub(in crate::game) fn mobile_draw(&self, b: &mut HudBatch) {
         use horizon_client::android_control_ui as ui;
+        let editing = self.mobile.controls.editor.is_some() || self.mobile.classic_pe.editor.active;
         if !self.has_touch()
             && !self.settings.keypad.enabled
-            && self.mobile.controls.editor.is_none()
+            && !editing
             && !self.mobile.ui.floating_menu
         {
             return;
         }
-        if self.ui.hide_gui
-            && self.mobile.controls.editor.is_none()
-            && !self.mobile.ui.floating_menu
-        {
+        if self.ui.hide_gui && !editing && !self.mobile.ui.floating_menu {
             return;
         }
         let tc = &self.mobile.controls;
+        if self.classic_pe_active() {
+            let in_menu = self.pad_in_menu();
+            if !in_menu || self.mobile.classic_pe.editor.active {
+                let opts = self.classic_pe_layout_options();
+                self.mobile.classic_pe.draw(
+                    b,
+                    &self.gui.atlas,
+                    opts,
+                    self.mobile.classic_pe.zoom_active(),
+                    !self.voice.mic_on(),
+                    self.touch_taps(),
+                );
+            } else if tc.in_inventory {
+                tc.draw(b, &self.gui.atlas);
+            }
+            if !self.mobile.classic_pe.editor.active {
+                self.mobile.ui.draw(b, &self.gui.atlas, in_menu);
+                self.mobile
+                    .ui
+                    .draw_floating_menu(b, &self.gui.atlas, &tc.settings);
+            }
+            self.mobile.ui.draw_keyboard(b, &self.gui.atlas);
+            if self.mobile.ui.virtual_mouse {
+                ui::draw_pointer(
+                    b,
+                    &self.gui.atlas,
+                    self.cursor,
+                    tc.settings.virtual_mouse_pointer_scale,
+                );
+            }
+            return;
+        }
         tc.draw(b, &self.gui.atlas);
         ui::draw_goy_hud(
             tc,
@@ -441,6 +581,30 @@ impl Game<'_> {
             t.location.x as f32 / w.max(1) as f32,
             t.location.y as f32 / h.max(1) as f32,
         ];
+        if self.classic_pe_active() && self.mobile.classic_pe.editor.active {
+            use horizon_client::classic_pe_touch::TouchPhaseKind;
+            let phase = match t.phase {
+                TouchPhase::Started => TouchPhaseKind::Started,
+                TouchPhase::Moved => TouchPhaseKind::Moved,
+                TouchPhase::Ended => TouchPhaseKind::Ended,
+                TouchPhase::Cancelled => TouchPhaseKind::Cancelled,
+            };
+            let opts = self.classic_pe_layout_options();
+            let home = horizon_client::logging::game_home();
+            let ev = self.mobile.classic_pe.touch_event(
+                t.id,
+                phase,
+                (p[0], p[1]),
+                (b.width, b.height),
+                opts,
+                &home,
+            );
+            if ev.clicked {
+                self.audio.play_button_click();
+                self.android_touch_haptic(10);
+            }
+            return;
+        }
         if self.mobile.controls.editor.is_some() {
             horizon_client::android_control_ui::touch_hud_editor(
                 &mut self.mobile.controls,
@@ -552,6 +716,104 @@ impl Game<'_> {
             self.android_menu_touch(t, events, id);
             return;
         }
+        if self.classic_pe_active() {
+            use horizon_client::classic_pe_touch::TouchPhaseKind;
+            if !self.captured && self.focused {
+                self.capture(true);
+            }
+            let phase = match t.phase {
+                TouchPhase::Started => TouchPhaseKind::Started,
+                TouchPhase::Moved => TouchPhaseKind::Moved,
+                TouchPhase::Ended => TouchPhaseKind::Ended,
+                TouchPhase::Cancelled => TouchPhaseKind::Cancelled,
+            };
+            let opts = self.classic_pe_layout_options();
+            let home = horizon_client::logging::game_home();
+            let ev = self.mobile.classic_pe.touch_event(
+                t.id,
+                phase,
+                (p[0], p[1]),
+                (b.width, b.height),
+                opts,
+                &home,
+            );
+            if ev.clicked {
+                self.audio.play_button_click();
+                self.android_touch_haptic(10);
+            }
+            if let Some(slot) = ev.hotbar_slot {
+                self.selected = slot;
+            }
+            if ev.pause {
+                self.pad.touch_tap(horizon_client::gamepad::Button::Start);
+            }
+            if ev.inventory {
+                self.pad.touch_tap(horizon_client::gamepad::Button::North);
+            }
+            if ev.chat {
+                self.pad
+                    .touch_tap(horizon_client::gamepad::Button::DPadRight);
+            }
+            if ev.perspective {
+                self.pad.touch_tap(horizon_client::gamepad::Button::DPadUp);
+            }
+            if ev.debug {
+                self.debug_key(KeyCode::F3, KeyAction::Press);
+                self.debug_key(KeyCode::F3, KeyAction::Release);
+            }
+            if let Some(down) = ev.player_list_toggled {
+                if down {
+                    self.physical_keys.insert(KeyCode::Tab);
+                } else {
+                    self.physical_keys.remove(&KeyCode::Tab);
+                }
+                let _ = self.mapped_key(KeyCode::Tab, down, false);
+            }
+            if ev.drop {
+                self.pad.touch_tap(horizon_client::gamepad::Button::East);
+            }
+            if ev.voice {
+                self.voice_toggle_mic();
+            }
+            if ev.waypoints {
+                self.mod_key_tap(&super::mod_keys::WAYPOINTS);
+            }
+            if ev.add_waypoint {
+                self.mod_key_tap(&super::mod_keys::ADD_WAYPOINT);
+            }
+            if ev.look_gui != [0.0, 0.0] {
+                let delta = [
+                    ev.look_gui[0] / b.width.max(1.0),
+                    ev.look_gui[1] / b.height.max(1.0),
+                ];
+                let turn = horizon_client::android_controls::camera_delta_with_mouse(
+                    delta,
+                    w,
+                    h,
+                    &self.mobile.controls.settings,
+                    self.settings.sensitivity,
+                    self.settings.invert_x,
+                    self.settings.invert_y,
+                    self.zoom_turn_scale() as f32,
+                );
+                if turn != [0.0, 0.0] {
+                    self.tutorial.mouse(turn[0] as f64, turn[1] as f64);
+                    self.turn_player(turn[0] as f64 / 0.15, turn[1] as f64 / 0.15);
+                }
+            }
+            if ev.tap_world {
+                self.mobile.touch_aim = ev.tap_aim_norm;
+                if self.pick_entity_hit().is_some()
+                    && self.using.is_none()
+                    && self.screen == Screen::Playing
+                {
+                    self.remote_start_attack();
+                } else {
+                    self.mobile.classic_pe.queue_use_tap();
+                }
+            }
+            return;
+        }
         if t.phase == TouchPhase::Started
             && !self.mobile.controls.control_at_point(n)
             && let Some(slot) = horizon_client::android_controls::hotbar_slot(b.width, b.height, p)
@@ -611,19 +873,32 @@ impl Game<'_> {
         match words.get(1).copied() {
             Some("edit") => self.mobile_open_editor(),
             Some("done") => {
-                self.mobile.controls.editor = None;
-                self.mobile.controls.settings.save()?;
+                if self.mobile.is_classic_pe() {
+                    self.mobile
+                        .classic_pe
+                        .close_editor(&horizon_client::logging::game_home());
+                } else {
+                    self.mobile.controls.editor = None;
+                    self.mobile.controls.settings.save()?;
+                }
             }
             Some("reset") => {
-                self.mobile.controls.settings = Default::default();
-                self.mobile.controls.settings.save()?;
+                if self.mobile.is_classic_pe() {
+                    let home = horizon_client::logging::game_home();
+                    self.mobile.classic_pe.config.reset();
+                    self.mobile.classic_pe.save(&home);
+                } else {
+                    self.mobile.controls.settings = Default::default();
+                    self.mobile.controls.settings.save()?;
+                }
             }
             None => {}
             Some(other) => return Err(format!("unknown touch-layout action: {other}").into()),
         }
         self.settings.touch = self.mobile.controls.settings.clone();
+        let editing = self.mobile.controls.editor.is_some() || self.mobile.classic_pe.editor.active;
         Ok(Some(
-            serde_json::json!({"ok":true,"editing":self.mobile.controls.editor.is_some(),"layout":self.mobile.controls.settings}),
+            serde_json::json!({"ok":true,"editing":editing,"layout":self.mobile.controls.settings}),
         ))
     }
 
@@ -1328,7 +1603,11 @@ impl Game<'_> {
             match menu_act {
                 InGameMenuAction::Close => {}
                 InGameMenuAction::OpenControlEditor => {
-                    self.mobile.controls.open_editor();
+                    if self.mobile.is_classic_pe() {
+                        self.mobile.classic_pe.open_editor();
+                    } else {
+                        self.mobile.controls.open_editor();
+                    }
                     self.android_sync_pointer();
                 }
                 InGameMenuAction::SetControlStyle(style) => {
@@ -1442,6 +1721,11 @@ impl Game<'_> {
                 InGameMenuAction::ToggleSplitTouch => {
                     self.mobile.controls.settings.toggle_split_touch();
                     let _ = self.mobile.controls.settings.save();
+                    self.mobile.classic_pe.config.split_controls =
+                        !self.mobile.classic_pe.config.split_controls;
+                    self.mobile
+                        .classic_pe
+                        .save(&horizon_client::logging::game_home());
                 }
                 InGameMenuAction::ToggleInvertY => {
                     let next = !self.mobile.controls.settings.invert_y;
@@ -1822,6 +2106,16 @@ impl Game<'_> {
             self.mobile.hardware_keys.clear();
             mobile_platform::cancel_vibration();
             self.mobile.controls.clear();
+            self.mobile.classic_pe.reset_active();
+            if self.mobile.classic_pe_sneaking {
+                self.mobile.classic_pe_sneaking = false;
+                self.sync_toggle(0);
+            }
+            if self.mobile.classic_pe.player_list_open {
+                self.mobile.classic_pe.player_list_open = false;
+                self.physical_keys.remove(&KeyCode::Tab);
+                let _ = self.mapped_key(KeyCode::Tab, false, false);
+            }
             self.mobile.touch_aim = None;
         }
         self.android_custom_events();

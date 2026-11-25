@@ -543,6 +543,13 @@ impl Game<'_> {
     pub(super) fn touch_taps(&self) -> bool {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         if self.mobile_controls_enabled() {
+            if self.mobile.is_classic_pe() && !self.settings.keypad.enabled {
+                return self.touch.live
+                    && self.touch_shown()
+                    && !self.mobile.classic_pe.config.split_controls
+                    && !self.mobile.classic_pe.editor.active
+                    && self.camera_type.first_person();
+            }
             return self.touch.live
                 && self.touch_shown()
                 && !self.mobile.controls.crosshair()
@@ -568,7 +575,12 @@ impl Game<'_> {
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         if self.mobile_controls_enabled() {
-            return self.mobile.controls.aim.or(self.mobile.touch_aim).map(|p| {
+            let aim = if self.mobile.is_classic_pe() && !self.settings.keypad.enabled {
+                self.mobile.classic_pe.aim_norm().or(self.mobile.touch_aim)
+            } else {
+                self.mobile.controls.aim.or(self.mobile.touch_aim)
+            };
+            return aim.map(|p| {
                 let [w, h] = self.touch_size();
                 [p[0] * w as f32, p[1] * h as f32]
             });
@@ -658,6 +670,7 @@ impl Game<'_> {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let wanted = self.touch.live
             && self.mobile.controls.editor.is_none()
+            && !self.mobile.classic_pe.editor.active
             && self.has_touch()
             && self.mobile.controls.settings.gyroscope;
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1372,6 +1385,9 @@ impl Game<'_> {
     pub(super) fn touch_sneaking(&self) -> bool {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         if self.mobile_controls_enabled() {
+            if self.mobile.is_classic_pe() && !self.settings.keypad.enabled {
+                return self.mobile.classic_pe.is_sneaking();
+            }
             return self
                 .mobile
                 .controls
