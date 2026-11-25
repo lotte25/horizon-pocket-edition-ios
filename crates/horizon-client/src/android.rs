@@ -1288,22 +1288,56 @@ pub fn main(app: AndroidApp) {
         log::warn!("Could not initialize diagnostics: {error}");
     }
     crate::diagnostics::collect_exits(&private);
-    crate::entry::start(Default::default(), || {
-        log::info!(
-            "Horizon: Android, game folder {}, private files {}, arguments {args:?}, environment {env:?}",
-            home.display(),
-            private.display()
-        );
-        for note in notes {
-            log::info!("{note}");
+    // Android's NativeActivity main thread has a ~1 MB stack on Android 15/16, which can
+    // overflow during Game::new with built-in native mods. Run entry::start on a 16 MB stack.
+    match std::thread::Builder::new()
+        .name("horizon-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            crate::entry::start(Default::default(), || {
+                log::info!(
+                    "Horizon: Android, game folder {}, private files {}, arguments {args:?}, environment {env:?}",
+                    home.display(),
+                    private.display()
+                );
+                for note in notes {
+                    log::info!("{note}");
+                }
+                // Read from the APK's assets, which the app above opens.
+                crate::preparer::put_shader_pack(&home);
+                // The saved Microsoft sign-in renews while the game loads.
+                crate::accounts::resume();
+                winit::platform::android::set_input_hook(input::hook);
+            });
+        }) {
+        Ok(handle) => {
+            let _ = handle.join();
         }
-        // Read from the APK's assets, which the app above opens.
-        crate::preparer::put_shader_pack(&home);
-        // The saved Microsoft sign-in renews while the game loads.
-        crate::accounts::resume();
-        winit::platform::android::set_input_hook(input::hook);
-    });
+        Err(error) => {
+            logcat(
+                log::Level::Error,
+                &format!("Horizon: could not spawn 16 MB game thread: {error}"),
+            );
+        }
+    }
     finish_and_exit()
+}
+
+/// Voice chat's microphone permission state: `1` = granted, `-1` = denied, `0` = not asked yet.
+pub fn mic_permission() -> i32 {
+    with_activity(|env, activity| {
+        env.call_method(activity, "micPermissionState", "()I", &[])?
+            .i()
+    })
+    .unwrap_or(0)
+}
+
+/// Ask Android for `RECORD_AUDIO` on the UI thread (for built-in Voice Chat).
+pub fn request_mic_permission() {
+    with_activity(|env, activity| {
+        env.call_method(activity, "requestMicPermission", "()V", &[])
+            .map(drop)
+    });
 }
 
 /// The end of the game's run, normal or not. Quit leaves the activity alive, and Android starts

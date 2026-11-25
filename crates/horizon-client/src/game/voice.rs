@@ -422,7 +422,7 @@ pub(super) struct Voice {
     #[cfg(target_os = "ios")]
     route_seen: std::cell::Cell<Option<(Instant, Option<phone::Output>)>>,
     /// The player was asked for the microphone this session (the system asks once ever).
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     asked: bool,
     /// The ring switch's line was shown this session.
     told_switch: bool,
@@ -480,7 +480,7 @@ impl Voice {
             talkers_at: None,
             #[cfg(target_os = "ios")]
             route_seen: std::cell::Cell::new(None),
-            #[cfg(target_os = "ios")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             asked: false,
             told_switch: false,
             #[cfg(target_os = "ios")]
@@ -812,6 +812,19 @@ impl Game<'_> {
                 phone::Permission::Unknown => {
                     if !std::mem::replace(&mut self.voice.asked, true) {
                         phone::request_mic_permission();
+                    }
+                    None
+                }
+            };
+        }
+        #[cfg(target_os = "android")]
+        if self.voice.tone.is_none() {
+            return match crate::android::mic_permission() {
+                1 => Some(true),
+                -1 => Some(false),
+                _ => {
+                    if !std::mem::replace(&mut self.voice.asked, true) {
+                        crate::android::request_mic_permission();
                     }
                     None
                 }

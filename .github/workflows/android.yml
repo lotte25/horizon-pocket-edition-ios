@@ -1,0 +1,164 @@
+name: android
+run-name: Android · ${{ inputs.mods && format('native mods {0} · ', inputs.mods) || '' }}${{ github.sha }}
+# Horizon on Android (Starling + Shared Worlds + Classic PE touch + 15 built-in native QoL mods):
+# modeled on horizon-ios's android.yml, cross-compiled for arm64-v8a with cargo-ndk and packaged
+# via packaging/android/build_apk.py into Horizon.apk.
+#
+# Signing: set the repository secrets ANDROID_KEYSTORE (a base64 .jks/.keystore holding the alias
+# `horizon`) and ANDROID_KEYSTORE_PASSWORD, so every build updates the installed app. Without them
+# each run signs with a throwaway debug key, and installing it means uninstalling the last one
+# first, which deletes the app's private files.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      mods:
+        description: "Native mods to build in (ids, spaces or commas; empty = no native mods)"
+        type: string
+        default: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud treefall waymap zoom"
+      variant:
+        description: "APK variant: dev (side-by-side install) or release"
+        type: choice
+        default: dev
+        options:
+          - dev
+          - release
+      profile:
+        description: "Cargo profile (fast = Starling release default; release = full thin-LTO)"
+        type: choice
+        default: fast
+        options:
+          - fast
+          - release
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'third_party/**'
+      - 'native-mods/**'
+      - 'packaging/android/**'
+      - '.github/workflows/android.yml'
+permissions:
+  contents: read
+concurrency:
+  group: android-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  ANDROID_TARGET: aarch64-linux-android
+  ANDROID_ABI: arm64-v8a
+  # Pinned in packaging/android/build_apk.py.
+  ANDROID_API: "26"
+  ANDROID_COMPILE_SDK: "36"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ env.ANDROID_TARGET }}
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: android-${{ env.ANDROID_TARGET }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/starling-native
+          key: android-tools-${{ runner.os }}-${{ hashFiles('packaging/android/native_build.sh') }}-v1
+      - name: Install Android SDK/NDK, cmake, and cargo-ndk
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
+          sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk" \
+            "platforms;android-$ANDROID_COMPILE_SDK" \
+            "build-tools;$ANDROID_BUILD_TOOLS" \
+            "ndk;$ANDROID_NDK_VERSION" > /dev/null
+          ndk="$sdk/ndk/$ANDROID_NDK_VERSION"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          tools="$HOME/.cache/starling-native/cargo-ndk"
+          if [ ! -x "$tools/bin/cargo-ndk" ]; then
+            cargo install --locked cargo-ndk --root "$tools"
+          fi
+          echo "$tools/bin" >> "$GITHUB_PATH"
+      - name: Stage native mods
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODS: ${{ inputs.mods }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            MODS="$INPUT_MODS"
+          else
+            MODS="appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud treefall waymap zoom"
+          fi
+          read -ra ids <<< "$(printf '%s' "$MODS" | tr ',' ' ')"
+          if [ "${#ids[@]}" -eq 0 ]; then
+            echo "No native mods requested; building plain Android APK."
+            exit 0
+          fi
+          curl -fsSL --retry 3 https://horizon-rust.github.io/horizon-mods/index.json -o "$RUNNER_TEMP/index.json"
+          python3 tools/ios_native_mods.py fetch "$RUNNER_TEMP/index.json" "$RUNNER_TEMP/native" "${ids[@]}"
+          bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles"
+      - name: Build, pack, and sign the .apk
+        env:
+          PROFILE: ${{ inputs.profile || 'fast' }}
+          VARIANT: ${{ inputs.variant || 'dev' }}
+          # PR code is unmerged: always use a throwaway key, even for same-repository PRs.
+          KEYSTORE: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEYSTORE || '' }}
+          KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/key.jks"
+            export HORIZON_ANDROID_KEYSTORE="$RUNNER_TEMP/key.jks"
+            export HORIZON_ANDROID_KEY_ALIAS="horizon"
+            export HORIZON_ANDROID_STORE_PASSWORD="$KEYSTORE_PASSWORD"
+            export HORIZON_ANDROID_KEY_PASSWORD="$KEYSTORE_PASSWORD"
+          else
+            echo "::warning::no ANDROID_KEYSTORE secret: signed with a throwaway debug key, so this .apk cannot update the last one"
+          fi
+          variant_flag=()
+          if [ "$VARIANT" = "dev" ]; then
+            variant_flag=(--dev)
+          fi
+          python3 packaging/android/build_apk.py \
+            --abi "$ANDROID_ABI" \
+            --profile "$PROFILE" \
+            "${variant_flag[@]}"
+          apk="$(find target/android -maxdepth 1 -name "starling-*-$ANDROID_ABI.apk" | head -n 1)"
+          test -f "$apk"
+          cp "$apk" Horizon.apk
+          # The library must really export the entry points NativeActivity and StarlingActivity call.
+          so="target/android/libhorizon_android.so"
+          nm="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          "$nm" -D --defined-only "$so" | grep -q ' starling_on_create$'
+          "$nm" -D --defined-only "$so" | grep -q ' ANativeActivity_onCreate$'
+          unzip -l Horizon.apk
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: horizon-android
+          path: Horizon.apk
+          retention-days: 7
+          if-no-files-found: error

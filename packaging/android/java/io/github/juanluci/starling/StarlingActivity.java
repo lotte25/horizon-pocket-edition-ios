@@ -77,6 +77,11 @@ public class StarlingActivity extends NativeActivity {
     private static final int PICK_HORIZON = 2;
     /** Android's answer to the permissions the running build's mods need. */
     private static final int MOD_PERMISSIONS = 3;
+    /** Android's answer to built-in voice chat's RECORD_AUDIO request. */
+    private static final int VOICE_PERMISSION = 4;
+
+    /** 0 = unknown/pending, 1 = granted, -1 = denied (set by onRequestPermissionsResult). */
+    private volatile int micPermissionResult = 0;
 
     /** The build with native mods this game runs (loadGame), or null for the APK's own. */
     private File modBuild;
@@ -566,6 +571,43 @@ public class StarlingActivity extends NativeActivity {
                     }
                 })
                 .show();
+    }
+
+    /** Voice chat's RECORD_AUDIO state: 1 = granted, -1 = denied, 0 = not asked yet. */
+    public int micPermissionState() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED) {
+            return 1;
+        }
+        return micPermissionResult;
+    }
+
+    /** Ask Android for RECORD_AUDIO on the UI thread for built-in voice chat. */
+    public void requestMicPermission() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                        == PackageManager.PERMISSION_GRANTED) {
+                    micPermissionResult = 1;
+                    return;
+                }
+                requestPermissions(
+                        new String[] {Manifest.permission.RECORD_AUDIO},
+                        VOICE_PERMISSION);
+            }
+        });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == VOICE_PERMISSION) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            micPermissionResult = granted ? 1 : -1;
+        }
     }
 
     /**
