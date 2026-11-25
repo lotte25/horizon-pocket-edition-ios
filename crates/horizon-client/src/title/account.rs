@@ -21,6 +21,7 @@ enum Page {
     Files,
     Offline,
     Ely,
+    Authlib,
     Remove,
 }
 #[derive(Clone, Default)]
@@ -28,13 +29,14 @@ pub struct Screen {
     page: Page,
     offset: usize,
     focus: usize,
+    api_url: String,
     username: String,
     password: String,
     otp: String,
     remove: Option<Player>,
     dismiss_error: bool,
     show_password: bool,
-    microsoft: bool,
+    provider: Option<Provider>,
 }
 impl std::fmt::Debug for Screen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,10 +66,7 @@ fn rows(h: f32) -> usize {
 fn label(p: &Player) -> String {
     let provider = match p {
         Player::Offline(_) => tr("offline"),
-        Player::Account(a) => match a.provider {
-            Provider::Microsoft => "Microsoft".into(),
-            Provider::Ely => "Ely.by".into(),
-        },
+        Player::Account(a) => a.provider_label(),
     };
     format!("{} ({provider})", p.name())
 }
@@ -77,10 +76,10 @@ impl Screen {
     }
     fn status_for(&self, state: &State) -> Option<String> {
         match state {
-            State::Starting => Some(tr(if self.microsoft {
-                "requesting_code"
-            } else {
-                "ely_working"
+            State::Starting => Some(tr(match self.provider {
+                Some(Provider::AuthlibInjector) => "authlib_working",
+                Some(Provider::Ely) => "ely_working",
+                _ => "requesting_code",
             })),
             State::Resuming => Some(tr("restoring")),
             State::Progress(stage) => Some(crate::lang::get(stage.key())),
@@ -112,11 +111,14 @@ impl Screen {
             (Page::Ely, 0) => Some((("account-login", 0), &mut self.username, 254)),
             (Page::Ely, 1) => Some((("account-password", 0), &mut self.password, 256)),
             (Page::Ely, 2) => Some((("account-otp", 0), &mut self.otp, 6)),
+            (Page::Authlib, 0) => Some((("account-server", 0), &mut self.api_url, 254)),
+            (Page::Authlib, 1) => Some((("account-login", 0), &mut self.username, 254)),
+            (Page::Authlib, 2) => Some((("account-password", 0), &mut self.password, 256)),
             _ => None,
         }
     }
     pub(super) fn field_rect(&self, w: f32) -> Option<[f32; 4]> {
-        matches!(self.page, Page::Offline | Page::Ely).then(|| {
+        matches!(self.page, Page::Offline | Page::Ely | Page::Authlib).then(|| {
             [
                 (w / 2.0).floor() - 100.0,
                 50.0 + 38.0 * self.focus as f32,
@@ -126,17 +128,20 @@ impl Screen {
         })
     }
     pub(super) fn password_focused(&self) -> bool {
-        self.status().is_none() && self.page == Page::Ely && matches!(self.focus, 1 | 2)
+        self.status().is_none()
+            && ((self.page == Page::Ely && matches!(self.focus, 1 | 2))
+                || (self.page == Page::Authlib && self.focus == 2))
     }
     pub(super) fn password_masked(&self) -> bool {
-        self.password_focused() && (self.focus == 2 || !self.show_password)
+        self.password_focused()
+            && ((self.page == Page::Ely && self.focus == 2) || !self.show_password)
     }
     pub(super) fn focus_at(&mut self, (x, y): (f32, f32), w: f32) {
         if (x - w / 2.0).abs() > 100.0 {
             return;
         }
         let n = match self.page {
-            Page::Ely => 3,
+            Page::Ely | Page::Authlib => 3,
             Page::Offline => 1,
             _ => 0,
         };
@@ -181,15 +186,20 @@ impl Screen {
         }
         match self.page {
             Page::Signing => {}
-            Page::Offline | Page::Ely => {
-                let fields = if self.page == Page::Offline {
-                    vec![("name", &self.username, 16, "account-name")]
-                } else {
-                    vec![
+            Page::Offline | Page::Ely | Page::Authlib => {
+                let fields = match self.page {
+                    Page::Offline => vec![("name", &self.username, 16, "account-name")],
+                    Page::Ely => vec![
                         ("login", &self.username, 254, "account-login"),
                         ("password", &self.password, 256, "account-password"),
                         ("otp", &self.otp, 6, "account-otp"),
-                    ]
+                    ],
+                    Page::Authlib => vec![
+                        ("authlib_server", &self.api_url, 254, "account-server"),
+                        ("authlib_login", &self.username, 254, "account-login"),
+                        ("password", &self.password, 256, "account-password"),
+                    ],
+                    _ => Vec::new(),
                 };
                 for (i, (key, value, max, id)) in fields.into_iter().enumerate() {
                     let y = 50.0 + 38.0 * i as f32;
@@ -277,30 +287,32 @@ impl Screen {
         match self.page {
             Page::Signing => vec![b(50.0, h - 28.0, 200.0, tr("done"), true, 69)],
             Page::Add => vec![
-                b(50.0, 80.0, 200.0, "Microsoft".into(), true, 60),
-                b(50.0, 104.0, 200.0, "Ely.by".into(), true, 76),
-                b(50.0, 128.0, 200.0, tr("offline"), true, 77),
+                b(50.0, 72.0, 200.0, "Microsoft".into(), true, 60),
+                b(50.0, 96.0, 200.0, tr("setup.authlib_title"), true, 109),
+                b(50.0, 120.0, 200.0, "Ely.by".into(), true, 76),
+                b(50.0, 144.0, 200.0, tr("offline"), true, 77),
                 b(50.0, h - 28.0, 200.0, tr("back"), true, 70),
             ],
-            Page::Offline | Page::Ely => {
+            Page::Offline | Page::Ely | Page::Authlib => {
                 let valid = !self.username.trim().is_empty()
-                    && (self.page == Page::Offline || !self.password.is_empty());
+                    && (self.page == Page::Offline || !self.password.is_empty())
+                    && (self.page != Page::Authlib || !self.api_url.trim().is_empty());
                 let mut out = vec![
                     b(
                         if self.page == Page::Ely { 0.0 } else { 50.0 },
                         h - 52.0,
                         if self.page == Page::Ely { 148.0 } else { 200.0 },
-                        tr(if self.page == Page::Ely {
-                            "log_in"
-                        } else {
+                        tr(if self.page == Page::Offline {
                             "save"
+                        } else {
+                            "log_in"
                         }),
                         valid,
                         71,
                     ),
                     b(50.0, h - 28.0, 200.0, tr("back"), true, 70),
                 ];
-                if self.page == Page::Ely {
+                if matches!(self.page, Page::Ely | Page::Authlib) {
                     out.push(b(
                         50.0,
                         158.0,
@@ -313,6 +325,8 @@ impl Screen {
                         true,
                         108,
                     ));
+                }
+                if self.page == Page::Ely {
                     out.insert(1, b(152.0, h - 52.0, 148.0, tr("register"), true, 72));
                 }
                 out
@@ -390,7 +404,7 @@ impl Screen {
             60 => {
                 self.clear();
                 self.dismiss_error = false;
-                self.microsoft = true;
+                self.provider = Some(Provider::Microsoft);
                 self.page = Page::Signing;
                 accounts::sign_in();
             }
@@ -423,20 +437,36 @@ impl Screen {
             }
             71 => {
                 self.dismiss_error = false;
-                if self.page == Page::Offline {
-                    accounts::add_offline(self.username.clone());
-                } else {
-                    accounts::sign_in_ely(
-                        self.username.clone(),
-                        std::mem::take(&mut self.password),
-                        std::mem::take(&mut self.otp),
-                    );
+                match self.page {
+                    Page::Offline => {
+                        accounts::add_offline(self.username.clone());
+                        self.provider = None;
+                    }
+                    Page::Authlib => {
+                        accounts::sign_in_authlib(
+                            self.api_url.clone(),
+                            self.username.clone(),
+                            std::mem::take(&mut self.password),
+                        );
+                        self.provider = Some(Provider::AuthlibInjector);
+                    }
+                    _ => {
+                        accounts::sign_in_ely(
+                            self.username.clone(),
+                            std::mem::take(&mut self.password),
+                            std::mem::take(&mut self.otp),
+                        );
+                        self.provider = Some(Provider::Ely);
+                    }
                 }
                 self.page = Page::Signing;
                 self.show_password = false;
-                self.microsoft = false;
             }
             108 => self.show_password = !self.show_password,
+            109 => {
+                self.clear();
+                self.page = Page::Authlib;
+            }
             72 => {
                 let _ = crate::platform::open_link(if self.page == Page::Ely {
                     "https://account.ely.by/register"
@@ -504,17 +534,24 @@ impl Screen {
     pub(super) fn tab(&mut self, reverse: bool) -> bool {
         let n = match self.page {
             Page::Offline => 1,
-            Page::Ely => 3,
+            Page::Ely | Page::Authlib => 3,
             _ => return false,
         };
         self.focus = (self.focus + if reverse { n - 1 } else { 1 }) % n;
         true
     }
     pub(super) fn submit(&mut self, h: f32) -> bool {
-        if matches!(self.page, Page::Offline | Page::Ely)
-            && !self.username.trim().is_empty()
-            && (self.page == Page::Offline || !self.password.is_empty())
-        {
+        let ready = match self.page {
+            Page::Offline => !self.username.trim().is_empty(),
+            Page::Ely => !self.username.trim().is_empty() && !self.password.is_empty(),
+            Page::Authlib => {
+                !self.api_url.trim().is_empty()
+                    && !self.username.trim().is_empty()
+                    && !self.password.is_empty()
+            }
+            _ => false,
+        };
+        if ready {
             self.click(71, h);
             true
         } else {
@@ -523,7 +560,8 @@ impl Screen {
     }
     fn clear(&mut self) {
         self.show_password = false;
-        self.microsoft = false;
+        self.provider = None;
+        self.api_url.clear();
         self.password.clear();
         self.otp.clear();
         self.username.clear();
@@ -540,7 +578,7 @@ mod tests {
     fn signing_stays_on_its_result_and_enables_done_only_after_completion() {
         let mut screen = Screen {
             page: Page::Signing,
-            microsoft: true,
+            provider: Some(Provider::Microsoft),
             ..Default::default()
         };
         let done_enabled = |state: State| {
@@ -563,6 +601,8 @@ mod tests {
             name: "TestPlayer".into(),
             skin: None,
             cape: None,
+            api_url: None,
+            skin_domains: Vec::new(),
         };
         let state = State::SignedIn(account);
         assert!(done_enabled(state.clone()));

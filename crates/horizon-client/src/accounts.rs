@@ -123,6 +123,13 @@ fn use_session(account: &Account, secrets: &starling_account::Secrets) -> Result
         starling_account::Provider::Ely => {
             crate::auth::AuthSession::ely(&account.name, uuid, secrets.access_token())
         }
+        starling_account::Provider::AuthlibInjector => crate::auth::AuthSession::authlib(
+            &account.name,
+            uuid,
+            secrets.access_token(),
+            account.api_url.as_deref().unwrap_or(""),
+            account.skin_domains.clone(),
+        ),
     };
     session.xuid = secrets.xuid().map(str::to_owned);
     crate::auth::set_current(session);
@@ -236,11 +243,16 @@ pub fn player_key() -> Option<String> {
     player().map(|p| p.key())
 }
 
-/// The playing Microsoft account's skin on its profile, as last read (at sign-in, on renewal, after
-/// an upload): its URL and whether its arms are slim.
+/// The playing Microsoft or Authlib-Injector account's skin on its profile, as last read (at
+/// sign-in, on renewal, after an upload): its URL and whether its arms are slim.
 pub fn player_skin() -> Option<(String, bool)> {
     match player()? {
-        starling_account::Player::Account(account) if account.provider == Provider::Microsoft => {
+        starling_account::Player::Account(account)
+            if matches!(
+                account.provider,
+                Provider::Microsoft | Provider::AuthlibInjector
+            ) =>
+        {
             account.skin.map(|(url, model)| (url, model == "slim"))
         }
         _ => None,
@@ -260,7 +272,8 @@ pub fn ely_skin() -> Option<(String, bool)> {
 }
 
 /// Where the playing profile's skin can go besides this game: a Microsoft account's profile (and
-/// how the last upload there went), Ely.by's website, or nowhere for an offline one.
+/// how the last upload there went), Ely.by's website, or nowhere for an offline / Authlib-Injector
+/// one.
 pub fn skin_cloud() -> crate::own_skin::Cloud {
     use crate::own_skin::{Cloud, Upload};
     let Some(starling_account::Player::Account(account)) = player() else {
@@ -268,6 +281,7 @@ pub fn skin_cloud() -> crate::own_skin::Cloud {
     };
     match account.provider {
         Provider::Ely => Cloud::Ely,
+        Provider::AuthlibInjector => Cloud::Local,
         Provider::Microsoft => {
             let key = account.key();
             Cloud::Microsoft(match &shared().skin_upload {
@@ -443,6 +457,27 @@ pub fn sign_in_ely(username: String, password: String, otp: String) {
             &username,
             &password,
             &otp,
+            &|| cancel.load(Ordering::Relaxed),
+        )
+        .and_then(|_| renew(generation));
+        finish(generation, result);
+    });
+    keep_renewing();
+}
+pub fn sign_in_authlib(api_url: String, username: String, password: String) {
+    let (generation, cancel) = begin(State::Starting);
+    let working = KeepWorking::new(
+        &format!("sign-in-{generation}"),
+        &crate::lang::get("starling.account.authlib_working"),
+    );
+    std::thread::spawn(move || {
+        let _working = working;
+        let result = starling_account::keep_authlib(
+            store().as_ref(),
+            &dir(),
+            &api_url,
+            &username,
+            &password,
             &|| cancel.load(Ordering::Relaxed),
         )
         .and_then(|_| renew(generation));

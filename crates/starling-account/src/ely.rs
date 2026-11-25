@@ -60,6 +60,8 @@ fn decode(value: &Value, client: &str) -> Result<(Account, Secrets), String> {
             name,
             skin: None,
             cape: None,
+            api_url: None,
+            skin_domains: Vec::new(),
         },
         Secrets {
             provider: Provider::Ely,

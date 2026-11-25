@@ -179,6 +179,24 @@ pub fn keep_ely(
     list.save(dir)?;
     Ok(account)
 }
+pub fn keep_authlib(
+    store: &dyn SecretStore,
+    dir: &Path,
+    api_url: &str,
+    username: &str,
+    password: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Account, String> {
+    let (account, secrets) = authlib::authenticate(api_url, username, password)?;
+    let _lock = account_lock();
+    if cancelled() {
+        return Err("starling.account.error.sign_in_cancelled".into());
+    }
+    let mut list = Accounts::load(dir);
+    list.add(store, account.clone(), &secrets)?;
+    list.save(dir)?;
+    Ok(account)
+}
 
 #[cfg(test)]
 mod tests {
@@ -209,6 +227,9 @@ mod tests {
                 name: "Player".into(),
                 skin: None,
                 cape: None,
+                api_url: (provider == Provider::AuthlibInjector)
+                    .then(|| "https://drasl.example/authlib-injector".into()),
+                skin_domains: Vec::new(),
             },
             Secrets {
                 provider,

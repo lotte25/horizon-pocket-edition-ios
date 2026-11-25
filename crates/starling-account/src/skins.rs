@@ -177,6 +177,8 @@ mod tests {
                 "classic".into(),
             )),
             cape: None,
+            api_url: None,
+            skin_domains: Vec::new(),
         };
         let secrets = Secrets {
             provider,

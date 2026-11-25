@@ -14,13 +14,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod authlib;
 pub mod ely;
 pub mod files;
 pub mod java;
 mod profiles;
 pub mod skins;
 pub use profiles::{
-    Player, activate_profile, add_offline, add_offline_if, keep_ely, remove_profile,
+    Player, activate_profile, add_offline, add_offline_if, keep_authlib, keep_ely, remove_profile,
     remove_profile_if, select_profile, select_profile_if, valid_offline_name,
 };
 
@@ -464,6 +465,7 @@ pub enum Provider {
     #[default]
     Microsoft,
     Ely,
+    AuthlibInjector,
 }
 
 /// A Minecraft profile, as the game shows and remembers it (no secrets).
@@ -474,11 +476,17 @@ pub struct Account {
     /// The profile UUID without dashes.
     pub uuid: String,
     pub name: String,
-    /// The active skin's URL (textures.minecraft.net) and model ("classic" or "slim").
+    /// The active skin's URL (textures.minecraft.net or custom Yggdrasil host) and model ("classic" or "slim").
     #[serde(default)]
     pub skin: Option<(String, String)>,
     #[serde(default)]
     pub cape: Option<String>,
+    /// Resolved authlib-injector Yggdrasil API root URL (only set for `Provider::AuthlibInjector`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+    /// Allowed skin texture domains advertised by the Yggdrasil server's metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skin_domains: Vec<String>,
 }
 
 impl Account {
@@ -486,6 +494,23 @@ impl Account {
         match self.provider {
             Provider::Microsoft => self.uuid.clone(),
             Provider::Ely => format!("ely{}", self.uuid),
+            Provider::AuthlibInjector => format!(
+                "ali{:016x}{}",
+                authlib::url_key_hash(self.api_url.as_deref().unwrap_or("")),
+                self.uuid
+            ),
+        }
+    }
+    /// Short human-readable provider label (e.g. "Microsoft", "Ely.by", or the authlib server host).
+    pub fn provider_label(&self) -> String {
+        match self.provider {
+            Provider::Microsoft => "Microsoft".into(),
+            Provider::Ely => "Ely.by".into(),
+            Provider::AuthlibInjector => self
+                .api_url
+                .as_deref()
+                .and_then(authlib::url_host)
+                .unwrap_or_else(|| "Authlib".into()),
         }
     }
     /// The UUID as a number, as the game keeps a player's.
@@ -531,6 +556,8 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Account, String> {
             ))
         }),
         cape: active("capes").and_then(|c| str_field(&c, "url")),
+        api_url: None,
+        skin_domains: Vec::new(),
     })
 }
 
@@ -606,6 +633,9 @@ pub fn fresh(
     }
     if account.provider == Provider::Ely {
         return ely::fresh(account, secrets);
+    }
+    if account.provider == Provider::AuthlibInjector {
+        return authlib::fresh(account, secrets);
     }
     if secrets.minecraft_expires_at > now() + RENEW_BEFORE {
         return Ok((account.clone(), secrets));

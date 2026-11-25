@@ -200,6 +200,8 @@ fn notch() -> Account {
         name: "Notch".into(),
         skin: None,
         cape: None,
+        api_url: None,
+        skin_domains: Vec::new(),
     }
 }
 
@@ -236,6 +238,8 @@ fn the_whole_chain() {
                 "slim".into()
             )),
             cape: Some("http://textures.minecraft.net/texture/cape2".into()),
+            api_url: None,
+            skin_domains: Vec::new(),
         }
     );
     assert_eq!(

@@ -42,6 +42,52 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Whether `url` is allowed by the active authlib-injector session's `skinDomains` (or API host).
+fn allowed_by_authlib(url: &str) -> bool {
+    let Some(session) = crate::auth::current() else {
+        return false;
+    };
+    if !session.is_authlib() {
+        return false;
+    }
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(b) = authority.strip_prefix('[') {
+        b.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    }
+    .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    let matches_domain = |domain: &str| {
+        let d = domain.trim().to_ascii_lowercase();
+        if let Some(suffix) = d.strip_prefix('.') {
+            host == suffix || host.ends_with(&d)
+        } else {
+            host == d
+        }
+    };
+    if session.skin_domains().iter().any(|d| matches_domain(d)) {
+        return true;
+    }
+    session
+        .authlib_api()
+        .and_then(|api| {
+            api.strip_prefix("https://")
+                .or_else(|| api.strip_prefix("http://"))
+        })
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .map(|auth| auth.split(':').next().unwrap_or(""))
+        .is_some_and(matches_domain)
+}
+
 /// `unpackTextures(property)`: the textures of a `textures` property's
 /// base64 JSON payload.
 pub fn unpack(value: &str, signature: Signature, valid_uris: &[&str]) -> Textures {
@@ -68,7 +114,8 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[&str]) -> Texture
         };
         let allowed = valid_uris
             .iter()
-            .any(|u| url.starts_with(&u.replace("{textureId}", "")));
+            .any(|u| url.starts_with(&u.replace("{textureId}", "")))
+            || allowed_by_authlib(url);
         if !allowed {
             return empty;
         }

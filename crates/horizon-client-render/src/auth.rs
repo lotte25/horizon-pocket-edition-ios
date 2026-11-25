@@ -17,19 +17,22 @@ pub const DEFAULT_DISCOVERY: &str = "https://discovery.minecraftservices.com/min
 /// A session file older than this is refused: it can't be replayed later.
 const MAX_SESSION_FILE_AGE: Duration = Duration::from_secs(120);
 
-/// A signed-in account (vanilla's User with type msa).
+/// A signed-in account (vanilla's User with type msa, ely, or authlib).
 pub struct AuthSession {
     pub name: String,
     pub uuid: u128,
     pub xuid: Option<String>,
     access_token: String,
     ely: bool,
+    authlib_api: Option<String>,
+    skin_domains: Vec<String>,
 }
 impl std::fmt::Debug for AuthSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthSession")
             .field("name", &self.name)
             .field("uuid", &horizon_protocol::crypto::uuid_string(self.uuid))
+            .field("authlib_api", &self.authlib_api)
             .field("access_token", &"<hidden>")
             .finish()
     }
@@ -43,14 +46,27 @@ pub fn parse_uuid(text: &str) -> Option<u128> {
         .flatten()
 }
 
+fn fnv1a_64(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 impl AuthSession {
     /// Cache identity includes the provider; tokens never form a cache key.
     pub fn account_key(&self) -> String {
-        format!(
-            "{}-{:032x}",
-            if self.ely { "ely" } else { "msa" },
-            self.uuid
-        )
+        if let Some(api) = &self.authlib_api {
+            format!("authlib-{:016x}-{:032x}", fnv1a_64(api), self.uuid)
+        } else {
+            format!(
+                "{}-{:032x}",
+                if self.ely { "ely" } else { "msa" },
+                self.uuid
+            )
+        }
     }
     /// For tests and harnesses.
     pub fn new(name: &str, uuid: u128, access_token: &str) -> Self {
@@ -60,6 +76,8 @@ impl AuthSession {
             xuid: None,
             access_token: access_token.to_owned(),
             ely: false,
+            authlib_api: None,
+            skin_domains: Vec::new(),
         }
     }
     pub fn ely(name: &str, uuid: u128, access_token: &str) -> Self {
@@ -67,11 +85,35 @@ impl AuthSession {
         session.ely = true;
         session
     }
+    pub fn authlib(
+        name: &str,
+        uuid: u128,
+        access_token: &str,
+        api_url: &str,
+        skin_domains: Vec<String>,
+    ) -> Self {
+        let mut session = Self::new(name, uuid, access_token);
+        session.authlib_api = Some(api_url.trim_end_matches('/').to_owned());
+        session.skin_domains = skin_domains;
+        session
+    }
     /// An Ely.by account: its skin is on Ely.by, not on Mojang's profile.
     pub fn is_ely(&self) -> bool {
         self.ely
     }
-    /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa", "xuid"}.
+    /// A custom authlib-injector (Yggdrasil) account.
+    pub fn is_authlib(&self) -> bool {
+        self.authlib_api.is_some()
+    }
+    /// Resolved authlib-injector Yggdrasil API root URL, if active.
+    pub fn authlib_api(&self) -> Option<&str> {
+        self.authlib_api.as_deref()
+    }
+    /// Allowed skin texture domains advertised by the authlib-injector server.
+    pub fn skin_domains(&self) -> &[String] {
+        &self.skin_domains
+    }
+    /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa"|"ely"|"authlib", "xuid"}.
     pub fn parse(text: &str) -> Result<Self, String> {
         let v: serde_json::Value =
             serde_json::from_str(text).map_err(|_| "the session is not valid JSON")?;
@@ -86,15 +128,30 @@ impl AuthSession {
         let access_token = field("access_token")
             .filter(|t| !t.is_empty())
             .ok_or("the session has no access token")?;
-        if field("user_type").is_some_and(|t| t != "msa" && t != "ely") {
-            return Err("the session is not a Microsoft account session".into());
+        if field("user_type").is_some_and(|t| t != "msa" && t != "ely" && t != "authlib") {
+            return Err("the session is not a supported account session".into());
         }
+        let authlib_api = field("authlib_api")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_owned());
+        let skin_domains = v
+            .get("skin_domains")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_ascii_lowercase))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             name: name.to_owned(),
             uuid,
             xuid: field("xuid").map(str::to_owned),
             access_token: access_token.to_owned(),
             ely: field("user_type") == Some("ely"),
+            authlib_api,
+            skin_domains,
         })
     }
     /// Read the session file the launcher wrote and delete it at once. It
@@ -241,7 +298,7 @@ pub fn endpoint(doc: &serde_json::Value, service: &str, name: &str) -> Option<St
 /// attributes call falls back to the offline properties, a failed profile call
 /// to no actions, as vanilla does. Blocks: call it off the main thread.
 pub fn fetch_account_status(session: &AuthSession) -> crate::ban_notice::AccountStatus {
-    if session.ely {
+    if session.ely || session.is_authlib() {
         return Default::default();
     }
     use crate::ban_notice::{AccountStatus, parse_profile_actions, parse_properties};
@@ -315,7 +372,9 @@ pub fn join_server(session: &AuthSession, server_hash: &str) -> Result<(), JoinE
 }
 
 fn join_server_once(session: &AuthSession, server_hash: &str) -> Result<(), JoinError> {
-    let url = if session.ely {
+    let url = if let Some(api) = &session.authlib_api {
+        format!("{api}/sessionserver/session/minecraft/join")
+    } else if session.ely {
         "https://authserver.ely.by/session/join".to_owned()
     } else {
         let doc = discovery()?;
@@ -441,7 +500,7 @@ pub fn parse_certificates(body: &str) -> Option<ChatKeyPair> {
 /// UserApiService.getKeyPair: the certificates endpoint, POSTed with the
 /// access token.
 pub fn fetch_chat_keys(session: &AuthSession) -> Result<ChatKeyPair, JoinError> {
-    if session.ely {
+    if session.ely || session.is_authlib() {
         return Err(JoinError::Unavailable);
     }
     let doc = discovery()?;
@@ -540,6 +599,24 @@ const MINECRAFT_PROFILE: &str = "https://api.minecraftservices.com/minecraft/pro
 pub fn own_textures(session: &AuthSession) -> Option<crate::skins::Textures> {
     if session.ely {
         return None;
+    }
+    if let Some(api) = &session.authlib_api {
+        let url = format!(
+            "{api}/sessionserver/session/minecraft/profile/{:032x}",
+            session.uuid
+        );
+        let response = agent().get(&url).call().ok()?;
+        if response.status() != 200 {
+            return None;
+        }
+        let body = response.into_string().ok()?;
+        let profile: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let (value, sig) = crate::skins::parse_profile(&profile).textures?;
+        return Some(crate::skins::unpack(
+            &value,
+            sig,
+            &crate::skins::TEXTURE_URIS,
+        ));
     }
     let response = agent()
         .get(MINECRAFT_PROFILE)

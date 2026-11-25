@@ -5,6 +5,7 @@ use winit::keyboard::KeyCode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     Ely,
+    Authlib,
     Offline,
 }
 pub(super) struct Form {
@@ -21,10 +22,10 @@ impl Form {
             kind,
             fields: std::array::from_fn(|i| {
                 let mut field = EditBox::new(0., 0., 200., 32.);
-                field.max_length = if kind == Kind::Offline {
-                    16
-                } else {
-                    [254, 256, 6][i]
+                field.max_length = match kind {
+                    Kind::Offline => 16,
+                    Kind::Ely => [254, 256, 6][i],
+                    Kind::Authlib => [256, 254, 256][i],
                 };
                 field
             }),
@@ -35,10 +36,14 @@ impl Form {
         }
     }
     fn count(&self) -> usize {
-        if self.kind == Kind::Ely { 3 } else { 1 }
+        if self.kind == Kind::Offline { 1 } else { 3 }
     }
     fn secret(&self) -> bool {
-        self.kind == Kind::Ely && self.focus.is_some_and(|i| i > 0)
+        match self.kind {
+            Kind::Ely => self.focus.is_some_and(|i| i > 0),
+            Kind::Authlib => self.focus == Some(2),
+            Kind::Offline => false,
+        }
     }
     fn sync(&self, show: bool) {
         #[cfg(target_os = "android")]
@@ -191,32 +196,49 @@ impl Form {
         false
     }
     pub fn submit(&mut self) -> bool {
-        if self.fields[0].value.trim().is_empty()
-            || (self.kind == Kind::Ely && self.fields[1].value.is_empty())
-        {
+        let ready = match self.kind {
+            Kind::Offline => !self.fields[0].value.trim().is_empty(),
+            Kind::Ely => {
+                !self.fields[0].value.trim().is_empty() && !self.fields[1].value.is_empty()
+            }
+            Kind::Authlib => {
+                !self.fields[0].value.trim().is_empty()
+                    && !self.fields[1].value.trim().is_empty()
+                    && !self.fields[2].value.is_empty()
+            }
+        };
+        if !ready {
             return false;
         }
         self.hide();
-        if self.kind == Kind::Ely {
-            accounts::sign_in_ely(
+        match self.kind {
+            Kind::Ely => accounts::sign_in_ely(
                 self.fields[0].value.clone(),
                 std::mem::take(&mut self.fields[1].value),
                 std::mem::take(&mut self.fields[2].value),
-            );
-        } else {
-            accounts::add_offline(self.fields[0].value.clone());
+            ),
+            Kind::Authlib => accounts::sign_in_authlib(
+                self.fields[0].value.clone(),
+                self.fields[1].value.clone(),
+                std::mem::take(&mut self.fields[2].value),
+            ),
+            Kind::Offline => accounts::add_offline(self.fields[0].value.clone()),
         }
         true
     }
     pub fn draw(
         &self,
         ui: &mut Ui,
-        actions: &mut [Option<([f32; 4], Action)>; 5],
+        actions: &mut [Option<([f32; 4], Action)>; 6],
         available_h: f32,
     ) {
         let w = ui.w;
         let cw = (w - 32.).min(520.);
-        let ch = if self.kind == Kind::Ely { 352. } else { 206. };
+        let ch = if self.kind == Kind::Offline {
+            206.
+        } else {
+            352.
+        };
         let x = (w - cw) / 2.;
         let y = ((available_h - ch) / 2.).max(8.);
         let inner = cw - 32.;
@@ -228,10 +250,10 @@ impl Form {
             x + 16.,
             y + 14.,
             color::TEXT,
-            &tr(if self.kind == Kind::Ely {
-                "setup.ely_title"
-            } else {
-                "setup.offline_title"
+            &tr(match self.kind {
+                Kind::Ely => "setup.ely_title",
+                Kind::Authlib => "setup.authlib_title",
+                Kind::Offline => "setup.offline_title",
             }),
         );
         let mut rects = [[0.; 4]; 3];
@@ -244,10 +266,10 @@ impl Form {
                 x + 16.,
                 fy,
                 color::MUTED,
-                &tr(if self.kind == Kind::Offline {
-                    "name"
-                } else {
-                    ["login", "password", "otp"][i]
+                &tr(match self.kind {
+                    Kind::Offline => "name",
+                    Kind::Ely => ["login", "password", "otp"][i],
+                    Kind::Authlib => ["authlib_server", "authlib_login", "password"][i],
                 }),
             );
             ui.rounded(rect[0], rect[1], rect[2], rect[3], 6., color::RAISED);
@@ -255,7 +277,9 @@ impl Form {
                 ui.border(rect[0], rect[1], rect[2], rect[3], 6., color::ACCENT);
             }
             let raw = &self.fields[i].value;
-            let shown = if self.kind == Kind::Ely && (i == 2 || (i == 1 && !self.show_password)) {
+            let masked = (self.kind == Kind::Ely && (i == 2 || (i == 1 && !self.show_password)))
+                || (self.kind == Kind::Authlib && i == 2 && !self.show_password);
+            let shown = if masked {
                 "*".repeat(raw.chars().count())
             } else {
                 raw.clone()
@@ -286,25 +310,27 @@ impl Form {
             }
         }
         self.rects.set(rects);
-        let specs = if self.kind == Kind::Ely {
-            vec![
+        let reveal_label = tr(if self.show_password {
+            "hide_password"
+        } else {
+            "show_password"
+        });
+        let specs = match self.kind {
+            Kind::Ely => vec![
                 (tr("log_in"), Action::SubmitForm),
                 (tr("back"), Action::AccountBack),
                 (tr("register"), Action::Register),
-                (
-                    tr(if self.show_password {
-                        "hide_password"
-                    } else {
-                        "show_password"
-                    }),
-                    Action::Reveal,
-                ),
-            ]
-        } else {
-            vec![
+                (reveal_label, Action::Reveal),
+            ],
+            Kind::Authlib => vec![
+                (tr("log_in"), Action::SubmitForm),
+                (tr("back"), Action::AccountBack),
+                (reveal_label, Action::Reveal),
+            ],
+            Kind::Offline => vec![
                 (tr("save"), Action::SubmitForm),
                 (tr("back"), Action::AccountBack),
-            ]
+            ],
         };
         for (i, (label, action)) in specs.into_iter().enumerate() {
             let row = i / 2;
