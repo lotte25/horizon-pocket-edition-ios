@@ -90,7 +90,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build
           sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk" \
+          sdkmanager="$(find "$sdk/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          test -x "$sdkmanager"
+          (yes || true) | "$sdkmanager" --sdk_root="$sdk" \
             "platforms;android-$ANDROID_COMPILE_SDK" \
             "build-tools;$ANDROID_BUILD_TOOLS" \
             "ndk;$ANDROID_NDK_VERSION" > /dev/null
@@ -113,7 +115,7 @@ jobs:
           else
             MODS="appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud treefall waymap zoom"
           fi
-          read -ra ids <<< "$(printf '%s' "$MODS" | tr ',' ' ')"
+          read -ra ids <<< "$(printf '%s' "$MODS" | tr ',' ' ')" || true
           if [ "${#ids[@]}" -eq 0 ]; then
             echo "No native mods requested; building plain Android APK."
             exit 0
