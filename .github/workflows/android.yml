@@ -113,7 +113,7 @@ jobs:
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             MODS="$INPUT_MODS"
           else
-            MODS="appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud treefall waymap zoom"
+            MODS="appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud treefall worldmap zoom"
           fi
           read -ra ids <<< "$(printf '%s' "$MODS" | tr ',' ' ')" || true
           if [ "${#ids[@]}" -eq 0 ]; then

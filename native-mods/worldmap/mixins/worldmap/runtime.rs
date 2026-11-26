@@ -2593,6 +2593,7 @@ pub fn key(game: &mut Game<'_>, key: &str, pressed: bool) {
                 s.entering = Some((String::new(), bx, bz));
             });
             game.native_mod_screen_open(ID);
+            game.native_mod_screen_typing(ID, true);
             return;
         }
     }
