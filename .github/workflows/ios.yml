@@ -18,9 +18,9 @@ on:
         type: boolean
         default: false
       mods:
-        description: "Native mods to build in (ids, spaces or commas: wrench fps_overlay); keeps the .ipa"
+        description: "Native mods to build in (ids, spaces or commas; empty = no native mods); keeps the .ipa"
         type: string
-        default: ""
+        default: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud worldmap zoom"
 permissions:
   contents: read
 concurrency:
