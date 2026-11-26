@@ -15,6 +15,7 @@ pub mod engine;
 pub mod jitter;
 pub mod resample;
 pub mod settings;
+pub mod svc;
 pub mod wire;
 
 /// The rate voices are coded at.

@@ -136,6 +136,7 @@ pub mod screen_layout;
 pub mod screen_narrator;
 pub mod social_screen;
 pub mod starling_releases;
+pub mod svc_net;
 pub mod voice_net;
 pub mod voice_screen;
 pub use horizon_server_files as server;

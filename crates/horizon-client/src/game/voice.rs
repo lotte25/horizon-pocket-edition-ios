@@ -7,34 +7,42 @@
 //! It is off when a world is joined, every time, and so is the microphone when it is turned
 //! on: nothing is heard, and nothing is said, that the player didn't ask for. Both stay as
 //! they are while the world changes hosts (the connection is made again, the session isn't).
-use super::Game;
+use super::{Game, Screen};
 use horizon_client::{
     Result,
     extras::Corner,
     extras_hud::Corners,
     hud::{HudBatch, rgba},
     lang,
+    svc_net::{SpatialSource, SvcUdpClient},
     text::Text,
     voice_net::{Link, Sender, Told},
-    voice_screen::{self, Action, Held},
+    voice_screen::{self, Action, GroupField, GroupView, Held, Tab},
 };
 #[cfg(target_os = "ios")]
 use horizon_gamecontroller::voice as phone;
 use horizon_voice::{
     engine::{CaptureOptions, CapturePipe, Playout},
     settings::Settings,
-    wire::{Entry, Up, VERSION},
+    svc::{
+        CH_CREATE_GROUP, CH_LEAVE_GROUP, CH_REQUEST_SECRET, CH_SECRET, CH_SET_GROUP, ClientGroup,
+        GroupType, MAX_GROUP_NAME, MAX_GROUP_PASSWORD, PlayerState as SvcPlayerState, SecretInfo,
+        SvcVersion, TcpIn, decode_secret, decode_tcp, encode_create_group, encode_join_group,
+        encode_leave_group, encode_request_secret, encode_update_state, spatial_params,
+    },
+    wire::{END, Entry, Up, VERSION},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+use winit::keyboard::KeyCode;
 
 fn tr(key: &str, english: &str) -> String {
     lang::get_or(&format!("horizon.voice.{key}"), english)
@@ -374,6 +382,84 @@ pub(super) struct Person {
     pub delay_ms: u32,
 }
 
+/// How long to wait before trying the next Simple Voice Chat protocol version (`21 -> 20 -> 18`).
+const SVC_PROBE_INTERVAL: Duration = Duration::from_millis(800);
+
+/// Strips the Minecraft TCP port from a `host:port` or `[ipv6]:port` server address.
+fn strip_mc_port(addr: &str) -> String {
+    let trimmed = addr.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[..end].to_owned();
+    }
+    if trimmed.matches(':').count() == 1
+        && let Some((host, _)) = trimmed.split_once(':')
+    {
+        return host.to_owned();
+    }
+    trimmed.to_owned()
+}
+
+/// Simple Voice Chat (`henkelmax/simple-voice-chat`) session state for external servers.
+struct SvcSession {
+    probe_idx: usize,
+    probe_at: Option<Instant>,
+    probed_version: Option<SvcVersion>,
+    secret: Option<SecretInfo>,
+    udp: Option<SvcUdpClient>,
+    server_host: String,
+    players: HashMap<u128, SvcPlayerState>,
+    groups: HashMap<u128, ClientGroup>,
+    joined_group: Option<u128>,
+    told_state: Option<(bool, bool)>,
+    failure_noted: bool,
+    mic_seq: Arc<AtomicI64>,
+}
+
+impl Default for SvcSession {
+    fn default() -> Self {
+        Self {
+            probe_idx: 0,
+            probe_at: None,
+            probed_version: None,
+            secret: None,
+            udp: None,
+            server_host: String::new(),
+            players: HashMap::new(),
+            groups: HashMap::new(),
+            joined_group: None,
+            told_state: None,
+            failure_noted: false,
+            mic_seq: Arc::new(AtomicI64::new(0)),
+        }
+    }
+}
+
+impl SvcSession {
+    fn is_active(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    fn groups_enabled(&self) -> bool {
+        self.secret.as_ref().is_some_and(|s| s.groups_enabled)
+    }
+
+    fn clear(&mut self) {
+        self.probe_idx = 0;
+        self.probe_at = None;
+        self.probed_version = None;
+        self.secret = None;
+        self.udp = None;
+        self.server_host.clear();
+        self.players.clear();
+        self.groups.clear();
+        self.joined_group = None;
+        self.told_state = None;
+        self.failure_noted = false;
+    }
+}
+
 pub(super) struct Voice {
     settings: Settings,
     /// The choices changed and aren't written yet, since when.
@@ -394,6 +480,8 @@ pub(super) struct Voice {
     /// What the host was last told.
     told_state: Option<(bool, bool)>,
     told_unwanted: Option<Vec<u8>>,
+    /// Simple Voice Chat session (active on external servers running SVC).
+    svc: SvcSession,
     /// The lines already shown this session: that it is there, and who uses it.
     hinted: bool,
     hinted_users: HashSet<u128>,
@@ -407,9 +495,20 @@ pub(super) struct Voice {
     /// The Friends screen shows voice chat's page; the slider held on it, the first of the
     /// people it shows, and a line about what was just done.
     page: bool,
+    /// Whether Voice Chat was opened directly from the Pause menu (so Back returns to Pause).
+    return_to_pause: bool,
     held: Option<Held>,
     first: usize,
     note: Option<(String, Instant)>,
+    /// Groups tab & form state (used on Simple Voice Chat servers with groups enabled).
+    tab: Tab,
+    create_mode: bool,
+    join_password_for: Option<(u128, String)>,
+    name_input: String,
+    password_input: String,
+    group_type: GroupType,
+    focused_field: Option<GroupField>,
+    groups_first: usize,
     /// The microphone's own thread, once a microphone was ever asked for, and whether it
     /// is opening one now.
     worker: Option<Worker>,
@@ -464,6 +563,7 @@ impl Voice {
             roster: Vec::new(),
             told_state: None,
             told_unwanted: None,
+            svc: SvcSession::default(),
             hinted: false,
             hinted_users: HashSet::new(),
             lines: Vec::new(),
@@ -471,9 +571,18 @@ impl Voice {
             probe: None,
             tone: None,
             page: false,
+            return_to_pause: false,
             held: None,
             first: 0,
             note: None,
+            tab: Tab::People,
+            create_mode: false,
+            join_password_for: None,
+            name_input: String::new(),
+            password_input: String::new(),
+            group_type: GroupType::Normal,
+            focused_field: None,
+            groups_first: 0,
             worker: None,
             opening: false,
             talkers: Vec::new(),
@@ -509,7 +618,7 @@ impl Voice {
 
     /// The host carries voices and this game is in their reach.
     pub(super) fn connected(&self) -> bool {
-        self.id.is_some()
+        self.id.is_some() || self.svc.udp.as_ref().is_some_and(|u| u.is_connected())
     }
 
     /// How loud the microphone hears now, and whether speech is going out.
@@ -531,6 +640,32 @@ impl Voice {
     /// The others in reach, as this player hears them.
     pub(super) fn people(&self) -> Vec<Person> {
         let heard = self.playout.heard();
+        if let Some(secret) = &self.svc.secret {
+            let mut list: Vec<Person> = self
+                .svc
+                .players
+                .values()
+                .filter(|p| p.uuid != secret.player_uuid && !p.disconnected)
+                .map(|p| {
+                    let uuid_hex = format!("{:032x}", p.uuid);
+                    let slot = self.svc.udp.as_ref().map(|u| u.slot_for(p.uuid));
+                    let now = slot.and_then(|s| heard.iter().find(|h| h.id == s));
+                    Person {
+                        uuid: p.uuid,
+                        name: p.name.clone(),
+                        enabled: !p.disabled,
+                        mic_live: !p.disabled && !p.muted,
+                        volume: self.settings.volume_of(&uuid_hex),
+                        muted: self.settings.is_muted(&uuid_hex),
+                        talking: now.is_some_and(|h| h.talking),
+                        level: now.map_or(0.0, |h| h.level),
+                        delay_ms: now.map_or(0, |h| h.delay_ms),
+                    }
+                })
+                .collect();
+            list.sort_by_key(|a| a.name.to_lowercase());
+            return list;
+        }
         self.roster
             .iter()
             .filter(|e| Some(e.id) != self.id)
@@ -552,8 +687,58 @@ impl Voice {
             .collect()
     }
 
+    /// Known Simple Voice Chat groups, sorted deterministically.
+    fn svc_group_views(&self) -> Vec<GroupView> {
+        let mut counts: HashMap<u128, usize> = HashMap::new();
+        for p in self.svc.players.values() {
+            if !p.disconnected
+                && let Some(gid) = p.group
+            {
+                *counts.entry(gid).or_insert(0) += 1;
+            }
+        }
+        let mut list: Vec<GroupView> = self
+            .svc
+            .groups
+            .values()
+            .filter(|g| !g.hidden)
+            .map(|g| GroupView {
+                id: g.id,
+                name: g.name.clone(),
+                has_password: g.has_password,
+                kind: g.kind,
+                members: counts.get(&g.id).copied().unwrap_or(0),
+                joined: self.svc.joined_group == Some(g.id),
+            })
+            .collect();
+        list.sort_by(|a, b| {
+            b.joined
+                .cmp(&a.joined)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        list
+    }
+
     /// Everyone's settings as the engine plays them, and the speakers the host needn't send.
     fn apply(&mut self) {
+        if let Some(secret) = &self.svc.secret {
+            if let Some(udp) = &self.svc.udp {
+                for p in self.svc.players.values() {
+                    if p.uuid == secret.player_uuid {
+                        continue;
+                    }
+                    let uuid = format!("{:032x}", p.uuid);
+                    let (volume, muted) = (
+                        self.settings.volume_of(&uuid),
+                        self.settings.is_muted(&uuid),
+                    );
+                    let slot = udp.slot_for(p.uuid);
+                    self.playout.set_speaker(slot, volume, muted);
+                }
+            }
+            self.playout.set_master(self.settings.voices);
+            return;
+        }
         let mut unwanted = Vec::new();
         let mut ids = Vec::new();
         for e in &self.roster {
@@ -716,6 +901,7 @@ impl Voice {
         self.roster.clear();
         self.told_state = None;
         self.told_unwanted = None;
+        self.svc.clear();
         self.playout.clear();
     }
 
@@ -732,9 +918,18 @@ impl Voice {
         self.hinted_users.clear();
         self.tone = None;
         self.page = false;
+        self.return_to_pause = false;
         self.held = None;
         self.first = 0;
         self.note = None;
+        self.tab = Tab::People;
+        self.create_mode = false;
+        self.join_password_for = None;
+        self.name_input.clear();
+        self.password_input.clear();
+        self.group_type = GroupType::Normal;
+        self.focused_field = None;
+        self.groups_first = 0;
         #[cfg(target_os = "ios")]
         {
             self.asked = false;
@@ -754,13 +949,15 @@ impl Game<'_> {
         self.system_message(Text::literal(text).with_color(HINT).bold());
     }
 
-    /// Voice chat can be turned on here: a shared world whose host carries voices.
+    /// Voice chat can be turned on here: a shared world whose host carries voices, or an
+    /// external server running Simple Voice Chat.
     pub(super) fn voice_offered(&self) -> bool {
-        self.shared_active()
+        (self.shared_active()
             && self
                 .remote
                 .as_ref()
-                .is_some_and(|r| r.session.voice.offered())
+                .is_some_and(|r| r.session.voice.offered()))
+            || self.voice.svc.is_active()
     }
 
     /// Turns voice chat on (the others are heard; the microphone stays off) or off.
@@ -771,6 +968,16 @@ impl Game<'_> {
         self.voice.enabled = on;
         self.voice.listen(on);
         if on {
+            if let Some(info) = self.voice.svc.secret.clone()
+                && self
+                    .voice
+                    .svc
+                    .udp
+                    .as_ref()
+                    .is_none_or(|u| u.failure().is_some())
+            {
+                self.voice_connect_svc_udp(info);
+            }
             self.voice.apply();
             self.voice_line(tr(
                 "on",
@@ -836,15 +1043,39 @@ impl Game<'_> {
     /// Starts the microphone: its pipe to the connection, and the device (or the checks'
     /// tone) that feeds it.
     fn voice_start_mic(&mut self) {
-        let Some(sender) = self.voice.sender.clone() else {
-            return;
-        };
-        let make: MakePipe = Box::new(move |options: CaptureOptions| {
-            let sender = sender.clone();
-            CapturePipe::start(Box::new(move |message| sender.send(message)), options)
+        let make: MakePipe = if let Some(udp) = &self.voice.svc.udp {
+            let mic_sender = udp.mic_sender();
+            let seq = self.voice.svc.mic_seq.clone();
+            Box::new(move |options: CaptureOptions| {
+                let mic_sender = mic_sender.clone();
+                let seq = seq.clone();
+                CapturePipe::start_raw(
+                    Box::new(move |_frame_seq, flags, opus| {
+                        if !opus.is_empty() {
+                            let s = seq.fetch_add(1, Ordering::Relaxed);
+                            mic_sender.send_mic(s, opus, false);
+                        }
+                        if (flags & END) != 0 {
+                            let s = seq.fetch_add(1, Ordering::Relaxed);
+                            mic_sender.send_mic(s, &[], false);
+                        }
+                    }),
+                    options,
+                )
                 .map(Arc::new)
                 .map_err(|e| e.to_string())
-        });
+            })
+        } else {
+            let Some(sender) = self.voice.sender.clone() else {
+                return;
+            };
+            Box::new(move |options: CaptureOptions| {
+                let sender = sender.clone();
+                CapturePipe::start(Box::new(move |message| sender.send(message)), options)
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+        };
         // The checks' tone is no device: nothing to wait for.
         if let Some(hz) = self.voice.tone {
             match make(CaptureOptions::default()) {
@@ -915,7 +1146,7 @@ impl Game<'_> {
         match answer {
             Ok(opened) => {
                 // Turned off again while it was being opened, or the connection went.
-                if !(self.voice.enabled && self.voice.mic_wanted && self.voice.id.is_some()) {
+                if !(self.voice.enabled && self.voice.mic_wanted && self.voice.connected()) {
                     self.voice.close(Some(opened.pipe));
                     return;
                 }
@@ -1046,20 +1277,299 @@ impl Game<'_> {
         }
     }
 
+    /// Opens the microphone when wanted and permitted (shared by Horizon voice & Simple Voice Chat).
+    fn voice_tick_mic(&mut self) {
+        self.voice_mic_opened();
+        if self.voice.enabled
+            && self.voice.mic_wanted
+            && self.voice.mic.is_none()
+            && !self.voice.opening
+        {
+            match self.voice_mic_allowed() {
+                Some(true) => {
+                    self.voice.mic_lost = None;
+                    self.voice_start_mic();
+                }
+                Some(false) => {
+                    self.voice.mic_wanted = false;
+                    self.voice_line(tr(
+                        "mic_denied",
+                        "The microphone isn't allowed. Allow it in the Settings app (Horizon PE > Microphone), then turn it on again here.",
+                    ));
+                }
+                // The player is being asked.
+                None => {}
+            }
+        }
+    }
+
+    /// World eye position of another player currently tracked in the level, for 3D proximity audio.
+    fn voice_remote_player_pos(&self, uuid: u128) -> Option<[f64; 3]> {
+        let entity_id = self.remote.as_ref()?.player_entity(uuid)?;
+        let mob = self.mobs.iter().find(|m| m.id == entity_id)?;
+        Some([mob.position.x, mob.position.y + 1.62, mob.position.z])
+    }
+
+    /// Starts (or restarts) the Simple Voice Chat encrypted UDP transport from `info`.
+    fn voice_connect_svc_udp(&mut self, info: SecretInfo) {
+        self.voice.svc.failure_noted = false;
+        match SvcUdpClient::connect(
+            info,
+            &self.voice.svc.server_host,
+            self.voice.playout.clone(),
+        ) {
+            Ok(client) => {
+                self.voice.svc.udp = Some(client);
+            }
+            Err(e) => {
+                log::warn!("Simple Voice Chat: failed to start UDP transport: {e}");
+                self.voice.svc.udp = None;
+                self.voice.svc.failure_noted = true;
+                self.voice.note = Some((
+                    tr("svc_udp_failed", "Voice chat UDP couldn't connect: %s")
+                        .replacen("%s", &e, 1),
+                    Instant::now(),
+                ));
+            }
+        }
+    }
+
+    /// Applies 3D proximity attenuation and stereo panning for every active SVC speaker slot.
+    fn voice_sync_spatial(&mut self) {
+        let Some(udp) = &self.voice.svc.udp else {
+            return;
+        };
+        let Some(player) = &self.player else {
+            return;
+        };
+        let listener = [
+            player.position.x,
+            player.position.y + 1.62,
+            player.position.z,
+        ];
+        let yaw = self.yaw;
+        let default_dist = self
+            .voice
+            .svc
+            .secret
+            .as_ref()
+            .map_or(48.0, |s| s.voice_distance as f32);
+        for (slot, source) in udp.spatial_snapshot() {
+            match source {
+                SpatialSource::Player { uuid, distance, .. } => {
+                    let max_dist = if distance > 0.0 {
+                        distance
+                    } else {
+                        default_dist
+                    };
+                    if let Some(pos) = self.voice_remote_player_pos(uuid) {
+                        let (atten, pan) = spatial_params(listener, yaw, pos, max_dist);
+                        self.voice.playout.set_spatial(slot, atten, pan);
+                    } else {
+                        self.voice.playout.set_spatial(slot, 0.5, 0.0);
+                    }
+                }
+                SpatialSource::Group { .. } => {
+                    self.voice.playout.set_spatial(slot, 1.0, 0.0);
+                }
+                SpatialSource::Location { pos, distance } => {
+                    let max_dist = if distance > 0.0 {
+                        distance
+                    } else {
+                        default_dist
+                    };
+                    let (atten, pan) = spatial_params(listener, yaw, pos, max_dist);
+                    self.voice.playout.set_spatial(slot, atten, pan);
+                }
+            }
+        }
+    }
+
+    /// Handles one incoming `voicechat:*` TCP plugin message from a Simple Voice Chat server.
+    fn voice_handle_svc_packet(&mut self, channel: &str, data: &[u8]) {
+        if channel == CH_SECRET {
+            let mut decoded = None;
+            if let Some(v) = self.voice.svc.probed_version {
+                decoded = decode_secret(v, data);
+            }
+            if decoded.is_none() {
+                for v in SvcVersion::PROBE_ORDER {
+                    if let Some(info) = decode_secret(v, data) {
+                        decoded = Some(info);
+                        break;
+                    }
+                }
+            }
+            let Some(info) = decoded else {
+                log::warn!(
+                    "Simple Voice Chat: ignoring unreadable voicechat:secret ({} bytes)",
+                    data.len()
+                );
+                return;
+            };
+            let first_connect = self.voice.svc.secret.is_none();
+            self.voice.svc.secret = Some(info.clone());
+            self.voice.svc.told_state = None;
+            self.voice_connect_svc_udp(info);
+            // Auto-connect listening on join, with microphone muted by default.
+            if first_connect && !self.voice.enabled {
+                self.voice.enabled = true;
+                self.voice.mic_wanted = false;
+                self.voice.listen(true);
+                self.voice.apply();
+                self.voice_line(tr(
+                    "svc_connected",
+                    "Simple Voice Chat connected (mic muted). Open Game Menu > Voice Chat or tap the mic button to talk.",
+                ));
+            } else {
+                self.voice.apply();
+            }
+            return;
+        }
+        let version = self
+            .voice
+            .svc
+            .secret
+            .as_ref()
+            .map(|s| s.version)
+            .or(self.voice.svc.probed_version)
+            .unwrap_or(SvcVersion::V21);
+        let Some(packet) = decode_tcp(version, channel, data) else {
+            return;
+        };
+        match packet {
+            TcpIn::Secret(_) => {}
+            TcpIn::PlayerState(state) => {
+                if state.disconnected {
+                    self.voice.svc.players.remove(&state.uuid);
+                } else {
+                    self.voice.svc.players.insert(state.uuid, state);
+                }
+                self.voice.apply();
+            }
+            TcpIn::PlayerStates(states) => {
+                self.voice.svc.players.clear();
+                for state in states {
+                    if !state.disconnected {
+                        self.voice.svc.players.insert(state.uuid, state);
+                    }
+                }
+                self.voice.apply();
+            }
+            TcpIn::RemovePlayerState(uuid) => {
+                self.voice.svc.players.remove(&uuid);
+                self.voice.apply();
+            }
+            TcpIn::AddGroup(group) => {
+                self.voice.svc.groups.insert(group.id, group);
+            }
+            TcpIn::RemoveGroup(id) => {
+                self.voice.svc.groups.remove(&id);
+                if self.voice.svc.joined_group == Some(id) {
+                    self.voice.svc.joined_group = None;
+                }
+            }
+            TcpIn::JoinedGroup {
+                group,
+                wrong_password,
+            } => {
+                if wrong_password {
+                    self.voice.note =
+                        Some((tr("wrong_password", "Wrong password."), Instant::now()));
+                    return;
+                }
+                self.voice.svc.joined_group = group;
+                self.voice.create_mode = false;
+                self.voice.join_password_for = None;
+                self.voice.name_input.clear();
+                self.voice.password_input.clear();
+                self.voice.focused_field = None;
+                if let Some(id) = group
+                    && let Some(g) = self.voice.svc.groups.get(&id)
+                {
+                    let name = g.name.clone();
+                    self.voice.note = Some((
+                        tr("joined_group", "Joined group: %s").replacen("%s", &name, 1),
+                        Instant::now(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Per-frame Simple Voice Chat discovery, packet handling, spatialization, and state sync.
+    fn tick_svc_voice(&mut self, link: &Arc<Link>) {
+        // Probe SVC versions (21 -> 20 -> 18) until voicechat:secret arrives.
+        if self.voice.svc.secret.is_none()
+            && self.voice.svc.probe_idx < SvcVersion::PROBE_ORDER.len()
+            && self
+                .voice
+                .svc
+                .probe_at
+                .is_none_or(|t| t.elapsed() >= SVC_PROBE_INTERVAL)
+            && let Some(sender) = &self.voice.sender
+        {
+            let version = SvcVersion::PROBE_ORDER[self.voice.svc.probe_idx];
+            sender.send_custom(CH_REQUEST_SECRET, encode_request_secret(version));
+            self.voice.svc.probed_version = Some(version);
+            self.voice.svc.probe_at = Some(Instant::now());
+            self.voice.svc.probe_idx += 1;
+        }
+
+        for (channel, data) in link.take_svc() {
+            self.voice_handle_svc_packet(&channel, &data);
+        }
+
+        let Some(version) = self.voice.svc.secret.as_ref().map(|s| s.version) else {
+            self.voice.save(false);
+            return;
+        };
+
+        if let Some(err) = self.voice.svc.udp.as_ref().and_then(|u| u.failure())
+            && !self.voice.svc.failure_noted
+        {
+            self.voice.svc.failure_noted = true;
+            self.voice.close_mic();
+            self.voice.mic_wanted = false;
+            self.voice.note = Some((
+                tr("svc_udp_lost", "Voice chat connection lost: %s").replacen("%s", &err, 1),
+                Instant::now(),
+            ));
+        }
+
+        if self.voice.enabled {
+            self.voice_sync_spatial();
+        }
+        if self.voice.connected() {
+            self.voice_tick_mic();
+        }
+
+        let state = (!self.voice.mic_on(), !self.voice.enabled);
+        if self.voice.svc.told_state != Some(state)
+            && let Some(sender) = &self.voice.sender
+        {
+            let (ch, payload) = encode_update_state(version, state.0, state.1);
+            sender.send_custom(ch, payload);
+            self.voice.svc.told_state = Some(state);
+        }
+        self.voice.save(false);
+    }
+
     /// Voice chat's work for this frame.
     pub(super) fn tick_voice(&mut self) {
         #[cfg(target_os = "ios")]
         self.voice_platform();
         self.voice_talkers();
-        // Only in a shared world, and only while its session lasts.
-        if !self.shared_active() {
-            if self.voice.enabled || self.voice.link.is_some() {
+        let shared = self.shared_active();
+        let external = !shared && self.external_server();
+        if !shared && !external {
+            if self.voice.enabled || self.voice.link.is_some() || self.voice.svc.is_active() {
                 self.voice.reset();
             }
             self.voice.save(false);
             return;
         }
-        // The connection of the moment: another one after a host change.
+        // The connection of the moment: another one after a host change or server switch.
         let link = self
             .remote
             .as_ref()
@@ -1074,7 +1584,9 @@ impl Game<'_> {
             self.voice.disconnected();
             if let (Some(link), Some(remote)) = (link, self.remote.as_ref()) {
                 self.voice.sender = Some(remote.session.voice_sender());
-                if self.voice.enabled {
+                if external {
+                    self.voice.svc.server_host = strip_mc_port(&remote.session.address);
+                } else if self.voice.enabled {
                     link.attach(Some(self.voice.playout.clone()));
                 }
                 self.voice.link = Some(link);
@@ -1082,10 +1594,11 @@ impl Game<'_> {
         }
         let Some(link) = self.voice.link.clone() else {
             // Between two hosts: a microphone that was live waits a while for the next.
-            if self
-                .voice
-                .mic_lost
-                .is_some_and(|at| at.elapsed() > MIC_KEPT_FOR)
+            if shared
+                && self
+                    .voice
+                    .mic_lost
+                    .is_some_and(|at| at.elapsed() > MIC_KEPT_FOR)
                 && self.voice.mic_wanted
             {
                 self.voice.mic_wanted = false;
@@ -1097,6 +1610,10 @@ impl Game<'_> {
             }
             return;
         };
+        if external {
+            self.tick_svc_voice(&link);
+            return;
+        }
         // The host carries voices: this game says it does too, once.
         if link.offered()
             && !self.voice.joined
@@ -1123,28 +1640,7 @@ impl Game<'_> {
             return;
         }
         // The microphone, as it is meant to be.
-        self.voice_mic_opened();
-        if self.voice.enabled
-            && self.voice.mic_wanted
-            && self.voice.mic.is_none()
-            && !self.voice.opening
-        {
-            match self.voice_mic_allowed() {
-                Some(true) => {
-                    self.voice.mic_lost = None;
-                    self.voice_start_mic();
-                }
-                Some(false) => {
-                    self.voice.mic_wanted = false;
-                    self.voice_line(tr(
-                        "mic_denied",
-                        "The microphone isn't allowed. Allow it in the Settings app (Horizon PE > Microphone), then turn it on again here.",
-                    ));
-                }
-                // The player is being asked.
-                None => {}
-            }
-        }
+        self.voice_tick_mic();
         let state = (self.voice.enabled, self.voice.mic.is_some());
         if self.voice.told_state != Some(state)
             && let Some(sender) = &self.voice.sender
@@ -1267,6 +1763,7 @@ impl Game<'_> {
     fn voice_view(&self) -> voice_screen::View {
         let (mic_level, speaking) = self.voice.mic_level();
         let chosen = self.voice.mic_choice();
+        let groups_enabled = self.voice.svc.groups_enabled();
         voice_screen::View {
             offered: self.voice_offered(),
             enabled: self.voice.enabled(),
@@ -1303,6 +1800,25 @@ impl Game<'_> {
                 .filter(|(_, at)| at.elapsed() < Duration::from_secs(6))
                 .map(|(note, _)| note.clone())
                 .or_else(|| self.voice_delay_note()),
+            groups_enabled,
+            tab: if groups_enabled {
+                self.voice.tab
+            } else {
+                Tab::People
+            },
+            groups: if groups_enabled {
+                self.voice.svc_group_views()
+            } else {
+                Vec::new()
+            },
+            joined_group: self.voice.svc.joined_group,
+            create_mode: self.voice.create_mode,
+            join_password_for: self.voice.join_password_for.clone(),
+            name_input: self.voice.name_input.clone(),
+            password_input: self.voice.password_input.clone(),
+            group_type: self.voice.group_type,
+            focused_field: self.voice.focused_field,
+            groups_first: self.voice.groups_first,
         }
     }
 
@@ -1329,15 +1845,105 @@ impl Game<'_> {
     /// Opens voice chat's page of the Friends screen.
     pub(super) fn voice_page_show(&mut self) {
         self.voice.page = true;
+        self.voice.return_to_pause = false;
         self.voice.held = None;
         self.voice.first = 0;
     }
 
-    /// Escape, or Back: from voice chat's page to the Friends screen. False when the page
-    /// wasn't open.
+    /// Opens voice chat's page directly from the Pause menu (so Back/Escape returns to Pause).
+    pub(super) fn voice_page_show_from_pause(&mut self) {
+        self.voice.page = true;
+        self.voice.return_to_pause = true;
+        self.voice.held = None;
+        self.voice.first = 0;
+        self.voice.tab = Tab::People;
+        self.voice.create_mode = false;
+        self.voice.join_password_for = None;
+        self.voice.focused_field = None;
+    }
+
+    /// Escape, or Back: closes an open group form first, then closes voice chat's page.
+    /// Returns false when the page wasn't open.
     pub(super) fn voice_page_close(&mut self) -> bool {
         self.voice.held = None;
-        std::mem::replace(&mut self.voice.page, false)
+        if self.voice.page && (self.voice.create_mode || self.voice.join_password_for.is_some()) {
+            self.voice.create_mode = false;
+            self.voice.join_password_for = None;
+            self.voice.focused_field = None;
+            self.voice.password_input.clear();
+            return true;
+        }
+        let was_open = std::mem::replace(&mut self.voice.page, false);
+        self.voice.focused_field = None;
+        if was_open && std::mem::take(&mut self.voice.return_to_pause) {
+            self.screen = Screen::Paused;
+            return true;
+        }
+        was_open
+    }
+
+    /// Whether a text field on the Voice Chat Groups screen currently has keyboard focus.
+    pub(super) fn voice_typing(&self) -> bool {
+        self.screen == Screen::Friends
+            && self.voice.page
+            && self.voice.svc.groups_enabled()
+            && self.voice.tab == Tab::Groups
+            && (self.voice.create_mode || self.voice.join_password_for.is_some())
+            && self.voice.focused_field.is_some()
+    }
+
+    /// Appends typed text into the currently focused Voice Chat group field.
+    pub(super) fn voice_type_text(&mut self, text: &str) {
+        let Some(field) = self.voice.focused_field else {
+            return;
+        };
+        let (target, limit) = match field {
+            GroupField::Name => (&mut self.voice.name_input, MAX_GROUP_NAME),
+            GroupField::Password => (&mut self.voice.password_input, MAX_GROUP_PASSWORD),
+        };
+        for ch in text.chars().filter(|c| !c.is_control()) {
+            if target.chars().count() < limit {
+                target.push(ch);
+            }
+        }
+    }
+
+    /// Handles a key press while a Voice Chat group text field has focus.
+    pub(super) fn voice_key_input(&mut self, key: KeyCode, text: Option<&str>) {
+        if !self.voice_typing() {
+            return;
+        }
+        match key {
+            KeyCode::Backspace => match self.voice.focused_field {
+                Some(GroupField::Name) => {
+                    self.voice.name_input.pop();
+                }
+                Some(GroupField::Password) => {
+                    self.voice.password_input.pop();
+                }
+                None => {}
+            },
+            KeyCode::Tab if self.voice.create_mode => {
+                self.voice.focused_field = match self.voice.focused_field {
+                    Some(GroupField::Name) => Some(GroupField::Password),
+                    _ => Some(GroupField::Name),
+                };
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if self.voice.create_mode && !self.voice.name_input.trim().is_empty() {
+                    self.voice_act(Action::SubmitCreateGroup);
+                } else if self.voice.join_password_for.is_some()
+                    && !self.voice.password_input.is_empty()
+                {
+                    self.voice_act(Action::SubmitJoinPassword);
+                }
+            }
+            _ => {
+                if let Some(t) = text {
+                    self.voice_type_text(t);
+                }
+            }
+        }
     }
 
     pub(super) fn draw_voice_page(&mut self, batch: &mut HudBatch) {
@@ -1360,8 +1966,12 @@ impl Game<'_> {
         let Some((action, held)) =
             voice_screen::press(&self.gui.atlas, self.gui_size(), self.cursor, &view)
         else {
+            self.voice.focused_field = None;
             return;
         };
+        if !matches!(action, Action::FocusField(_)) {
+            self.voice.focused_field = None;
+        }
         if held.is_none() {
             self.audio.play_button_click();
         }
@@ -1435,6 +2045,88 @@ impl Game<'_> {
             Action::Volume(uuid, volume) => self.voice.set_volume(uuid, volume),
             Action::Mute(uuid, muted) => self.voice.set_muted(uuid, muted),
             Action::Page(first) => self.voice.first = first,
+            Action::Tab(tab) => {
+                self.voice.tab = tab;
+                self.voice.create_mode = false;
+                self.voice.join_password_for = None;
+                self.voice.focused_field = None;
+                self.voice.groups_first = 0;
+            }
+            Action::JoinGroup(id) => {
+                let Some(group) = self.voice.svc.groups.get(&id).cloned() else {
+                    return;
+                };
+                if group.has_password {
+                    self.voice.join_password_for = Some((id, group.name));
+                    self.voice.create_mode = false;
+                    self.voice.password_input.clear();
+                    self.voice.focused_field = Some(GroupField::Password);
+                    self.voice.note = None;
+                } else if let Some(sender) = &self.voice.sender {
+                    sender.send_custom(CH_SET_GROUP, encode_join_group(id, None));
+                }
+            }
+            Action::LeaveGroup => {
+                if let Some(sender) = &self.voice.sender {
+                    sender.send_custom(CH_LEAVE_GROUP, encode_leave_group());
+                }
+            }
+            Action::OpenCreateGroup => {
+                self.voice.create_mode = true;
+                self.voice.join_password_for = None;
+                self.voice.name_input.clear();
+                self.voice.password_input.clear();
+                self.voice.group_type = GroupType::Normal;
+                self.voice.focused_field = Some(GroupField::Name);
+                self.voice.note = None;
+            }
+            Action::CancelGroupForm => {
+                self.voice.create_mode = false;
+                self.voice.join_password_for = None;
+                self.voice.password_input.clear();
+                self.voice.focused_field = None;
+            }
+            Action::CycleGroupType => {
+                self.voice.group_type = match self.voice.group_type {
+                    GroupType::Normal => GroupType::Open,
+                    GroupType::Open => GroupType::Isolated,
+                    GroupType::Isolated => GroupType::Normal,
+                };
+            }
+            Action::SubmitCreateGroup => {
+                let name = self.voice.name_input.trim().to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                let pw = (!self.voice.password_input.is_empty())
+                    .then(|| self.voice.password_input.clone());
+                if let Some(sender) = &self.voice.sender {
+                    sender.send_custom(
+                        CH_CREATE_GROUP,
+                        encode_create_group(&name, pw.as_deref(), self.voice.group_type),
+                    );
+                }
+            }
+            Action::SubmitJoinPassword => {
+                let Some((id, _)) = self.voice.join_password_for else {
+                    return;
+                };
+                if self.voice.password_input.is_empty() {
+                    return;
+                }
+                if let Some(sender) = &self.voice.sender {
+                    sender.send_custom(
+                        CH_SET_GROUP,
+                        encode_join_group(id, Some(&self.voice.password_input)),
+                    );
+                }
+            }
+            Action::FocusField(field) => {
+                self.voice.focused_field = Some(field);
+            }
+            Action::GroupPage(first) => {
+                self.voice.groups_first = first;
+            }
             Action::Back => {
                 self.voice_page_close();
             }

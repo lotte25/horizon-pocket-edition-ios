@@ -68,10 +68,12 @@ fn pause_buttons(
     links: bool,
     additions: bool,
     split: bool,
+    voice: bool,
 ) -> Vec<(f32, f32, f32, &'static str, u8, bool)> {
     let row3 = links || additions;
-    let (x0, y0) = pause_grid(w, h, u8::from(row3) + u8::from(split));
-    let down = 24.0 * f32::from(u8::from(row3) + u8::from(split));
+    let extra = u8::from(row3) + u8::from(split) + u8::from(voice);
+    let (x0, y0) = pause_grid(w, h, extra);
+    let down = 24.0 * f32::from(extra);
     let mut v = vec![
         (x0 + 4.0, y0 + 50.0, 204.0, "menu.returnToGame", 0, true),
         (x0 + 4.0, y0 + 74.0, 98.0, "gui.advancements", 4, true),
@@ -88,6 +90,10 @@ fn pause_buttons(
     if split {
         let y = y0 + 122.0 + if row3 { 24.0 } else { 0.0 };
         v.push((x0 + 4.0, y, 204.0, SPLIT_SETTINGS, 30, true));
+    }
+    if voice {
+        let y = y0 + 122.0 + 24.0 * f32::from(u8::from(row3) + u8::from(split));
+        v.push((x0 + 4.0, y, 204.0, VOICE_CHAT, 31, true));
     }
     v.extend([
         (x0 + 4.0, y0 + 122.0 + down, 98.0, "menu.options", 1, true),
@@ -154,14 +160,20 @@ fn pause_icon_focus_ids(friends: bool) -> Vec<u8> {
         .collect()
 }
 const SPLIT_SETTINGS: &str = "horizon.pages.split_settings";
+const VOICE_CHAT: &str = "horizon.voice.title";
 fn pause_icons(
     w: f32,
     h: f32,
     links: bool,
     additions: bool,
     split: bool,
+    voice: bool,
 ) -> [(f32, f32, &'static str); 4] {
-    let (x0, y0) = pause_grid(w, h, u8::from(links || additions) + u8::from(split));
+    let (x0, y0) = pause_grid(
+        w,
+        h,
+        u8::from(links || additions) + u8::from(split) + u8::from(voice),
+    );
     let (x0, y) = (x0 + 60.0, y0 + 98.0);
     [
         (x0, y, "gui/sprites/pause_menu/bug"),
@@ -250,6 +262,7 @@ impl Game<'_> {
         );
         let links = !self.server_links().is_empty();
         let additions = self.pause_screen_additions();
+        let voice = self.voice_offered();
         let mut tooltip = None;
         for (x, y, bw, key, id, active) in pause_buttons(
             w,
@@ -258,11 +271,16 @@ impl Game<'_> {
             links,
             additions.is_some(),
             self.options.split_guest || self.split_hud.menu,
+            voice,
         ) {
             let is_focused = self.pause_focus == Some(id);
             let hover = active && (ui::hovered(self.cursor, x, y, bw, 20.0) || is_focused);
             let label = match (id, &additions) {
                 (14, Some((label, _))) => label.clone(),
+                (31, _) => Text::literal(horizon_client::lang::get_or(
+                    VOICE_CHAT,
+                    horizon_client::voice_screen::TITLE,
+                )),
                 _ if self.options.split_guest && key == "menu.disconnect" => {
                     Text::translate("horizon.split.leave", &[])
                 }
@@ -280,6 +298,7 @@ impl Game<'_> {
             links,
             additions.is_some(),
             self.options.split_guest || self.split_hud.menu,
+            voice,
         )
         .into_iter()
         .enumerate()
@@ -372,6 +391,10 @@ impl Game<'_> {
             // PauseScreen: `new SocialInteractionsScreen(this)`.
             15 => self.open_social(true),
             30 => self.open_split_settings(),
+            31 => {
+                self.screen = Screen::Friends;
+                self.voice_page_show_from_pause();
+            }
             // addCustomDialogButtons: DialogConnectionAccess.openDialog of the
             // additions dialog, from the pause menu.
             14 => {
@@ -398,12 +421,14 @@ impl Game<'_> {
         };
         let links = !self.server_links().is_empty();
         let additions = self.pause_screen_additions();
+        let voice = self.voice_offered();
         let icons = pause_icons(
             w,
             h,
             links,
             additions.is_some(),
             self.options.split_guest || self.split_hud.menu,
+            voice,
         );
         let friends = icons[FRIENDS_ICON];
         let hit = pause_buttons(
@@ -413,6 +438,7 @@ impl Game<'_> {
             links,
             additions.is_some(),
             self.options.split_guest || self.split_hud.menu,
+            voice,
         )
         .into_iter()
         .find(|b| b.5 && ui::hovered(self.cursor, b.0, b.1, b.2, 20.0))
@@ -446,6 +472,7 @@ impl Game<'_> {
             (b.width, b.height)
         };
         let links = !self.server_links().is_empty();
+        let voice = self.voice_offered();
         let buttons = pause_buttons(
             w,
             h,
@@ -453,6 +480,7 @@ impl Game<'_> {
             links,
             self.pause_screen_additions().is_some(),
             self.options.split_guest || self.split_hud.menu,
+            voice,
         );
         let mut active_ids: Vec<u8> = buttons.into_iter().filter(|b| b.5).map(|b| b.4).collect();
         let friends = self.friends_view().shown;
@@ -501,6 +529,7 @@ impl Game<'_> {
                     links,
                     self.pause_screen_additions().is_some(),
                     self.options.split_guest || self.split_hud.menu,
+                    voice,
                 );
                 let mut rects: Vec<(u8, f32, f32, f32)> = buttons
                     .into_iter()
@@ -514,6 +543,7 @@ impl Game<'_> {
                     links,
                     self.pause_screen_additions().is_some(),
                     self.options.split_guest || self.split_hud.menu,
+                    voice,
                 )
                 .into_iter()
                 .enumerate()
@@ -874,7 +904,7 @@ mod tests {
     #[test]
     fn pause_menu_uses_disconnect_for_servers_and_keeps_world_options() {
         for (remote, label) in [(false, "menu.returnToMenu"), (true, "menu.disconnect")] {
-            let buttons = pause_buttons(427.0, 240.0, remote, false, false, false);
+            let buttons = pause_buttons(427.0, 240.0, remote, false, false, false, false);
             let quit = buttons.iter().find(|b| b.4 == 2).unwrap();
             assert_eq!(quit.3, label);
             assert!(quit.5);
@@ -899,14 +929,14 @@ mod tests {
 
     #[test]
     fn server_links_adds_a_full_width_row_above_options() {
-        let with = pause_buttons(427.0, 240.0, true, true, false, false);
-        let without = pause_buttons(427.0, 240.0, true, false, false, false);
+        let with = pause_buttons(427.0, 240.0, true, true, false, false, false);
+        let without = pause_buttons(427.0, 240.0, true, false, false, false, false);
         let links = with.iter().find(|b| b.4 == 11).unwrap();
         assert_eq!(links.2, 204.0);
         assert_eq!(links.3, "menu.server_links");
         assert!(links.5);
         // The icon row sits above it; Options and Disconnect move down 24.
-        let icons = pause_icons(427.0, 240.0, true, false, false);
+        let icons = pause_icons(427.0, 240.0, true, false, false, false);
         let y0_icons = ((240.0f32 - 190.0) * 0.25).floor() + 98.0;
         assert_eq!(icons[0].1, y0_icons);
         assert!(links.1 > icons[0].1);
@@ -922,8 +952,8 @@ mod tests {
     fn pause_screen_additions_takes_the_server_links_row() {
         // getCustomAdditions: one additions button in row 3, never next to the
         // links button, so the grid keeps one extra row either way.
-        let with = pause_buttons(427.0, 240.0, true, true, true, false);
-        let links = pause_buttons(427.0, 240.0, true, true, false, false);
+        let with = pause_buttons(427.0, 240.0, true, true, true, false, false);
+        let links = pause_buttons(427.0, 240.0, true, true, false, false, false);
         assert!(with.iter().all(|b| b.4 != 11));
         let button = with.iter().find(|b| b.4 == 14).unwrap();
         assert_eq!(
@@ -936,14 +966,14 @@ mod tests {
             assert_eq!(add.1, link.1);
         }
         assert_eq!(
-            pause_icons(427.0, 240.0, true, true, false)[0].1,
-            pause_icons(427.0, 240.0, true, false, false)[0].1
+            pause_icons(427.0, 240.0, true, true, false, false)[0].1,
+            pause_icons(427.0, 240.0, true, false, false, false)[0].1
         );
     }
     #[test]
     fn split_settings_preserves_dialog_rows_and_icon_actions() {
         for (links, additions) in [(false, false), (true, false), (false, true), (true, true)] {
-            let buttons = pause_buttons(427.0, 300.0, true, links, additions, true);
+            let buttons = pause_buttons(427.0, 300.0, true, links, additions, true, false);
             let split = buttons.iter().find(|b| b.4 == 30).unwrap();
             let options = buttons.iter().find(|b| b.4 == 1).unwrap();
             assert_eq!(options.1, split.1 + 24.0);
@@ -956,10 +986,24 @@ mod tests {
             }
             assert!(buttons.iter().all(|b| b.4 != 12 && b.4 != 13));
             assert!(
-                !pause_buttons(427.0, 300.0, true, links, additions, false)
+                !pause_buttons(427.0, 300.0, true, links, additions, false, false)
                     .iter()
                     .any(|b| b.4 == 30)
             );
         }
+    }
+
+    #[test]
+    fn voice_chat_button_adds_a_full_width_row_above_options() {
+        let buttons = pause_buttons(427.0, 300.0, true, false, false, false, true);
+        let voice = buttons.iter().find(|b| b.4 == 31).unwrap();
+        let options = buttons.iter().find(|b| b.4 == 1).unwrap();
+        assert_eq!(voice.2, 204.0);
+        assert_eq!(options.1, voice.1 + 24.0);
+        assert!(
+            !pause_buttons(427.0, 300.0, true, false, false, false, false)
+                .iter()
+                .any(|b| b.4 == 31)
+        );
     }
 }

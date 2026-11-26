@@ -1425,6 +1425,15 @@ impl Game<'_> {
             if key != Some(KeyCode::Enter) {
                 self.world_options_text(text);
             }
+        } else if self.voice_typing() {
+            match text {
+                Some(t) => self.voice_type_text(t),
+                None => {
+                    if let Some(k) = key {
+                        self.voice_key_input(k, None);
+                    }
+                }
+            }
         } else if self.screen == Screen::Options {
             let result = match text {
                 Some(t) => {

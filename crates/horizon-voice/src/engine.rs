@@ -41,6 +41,8 @@ pub fn gain_of(volume: f32) -> f32 {
 struct Speaker {
     jitter: Jitter,
     gain: f32,
+    spatial_gain: f32,
+    pan: f32,
     muted: bool,
     level: f32,
     talking: bool,
@@ -59,13 +61,17 @@ pub struct Heard {
 
 struct Inner {
     speakers: BTreeMap<u8, Speaker>,
-    /// One speaker's voice, and everyone's together, at 48 kHz.
+    /// One speaker's voice, and everyone's together (left & right), at 48 kHz.
     voice: Vec<f32>,
-    mix: Vec<f32>,
+    mix_l: Vec<f32>,
+    mix_r: Vec<f32>,
     /// To the sound output's rate, and what is made and not asked for yet.
-    resampler: Resampler,
-    fresh: Vec<f32>,
-    ready: VecDeque<f32>,
+    resampler_l: Resampler,
+    resampler_r: Resampler,
+    fresh_l: Vec<f32>,
+    fresh_r: Vec<f32>,
+    ready_l: VecDeque<f32>,
+    ready_r: VecDeque<f32>,
 }
 
 /// The others' voices, from the connection to the sound output.
@@ -85,10 +91,14 @@ impl Default for Playout {
             inner: Mutex::new(Inner {
                 speakers: BTreeMap::new(),
                 voice: Vec::new(),
-                mix: Vec::new(),
-                resampler: Resampler::new(RATE, RATE),
-                fresh: Vec::new(),
-                ready: VecDeque::new(),
+                mix_l: Vec::new(),
+                mix_r: Vec::new(),
+                resampler_l: Resampler::new(RATE, RATE),
+                resampler_r: Resampler::new(RATE, RATE),
+                fresh_l: Vec::new(),
+                fresh_r: Vec::new(),
+                ready_l: VecDeque::new(),
+                ready_r: VecDeque::new(),
             }),
             live: AtomicBool::new(false),
             master: AtomicU32::new(1f32.to_bits()),
@@ -115,6 +125,8 @@ impl Playout {
                 e.insert(Speaker {
                     jitter,
                     gain: 1.0,
+                    spatial_gain: 1.0,
+                    pan: 0.0,
                     muted: false,
                     level: 0.0,
                     talking: false,
@@ -146,11 +158,31 @@ impl Playout {
                 Speaker {
                     jitter,
                     gain: gain_of(volume),
+                    spatial_gain: 1.0,
+                    pan: 0.0,
                     muted,
                     level: 0.0,
                     talking: false,
                 },
             );
+        }
+    }
+
+    /// Sets proximity attenuation (`spatial_gain` in `0.0..=1.0`) and stereo pan (`pan` in
+    /// `-1.0..=1.0`, left to right) for speaker `id`.
+    pub fn set_spatial(&self, id: u8, spatial_gain: f32, pan: f32) {
+        let mut inner = locked(&self.inner);
+        if let Some(speaker) = inner.speakers.get_mut(&id) {
+            speaker.spatial_gain = if spatial_gain.is_finite() {
+                spatial_gain.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            speaker.pan = if pan.is_finite() {
+                pan.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
         }
     }
 
@@ -171,8 +203,10 @@ impl Playout {
     pub fn clear(&self) {
         let mut inner = locked(&self.inner);
         inner.speakers.clear();
-        inner.ready.clear();
-        inner.resampler.reset();
+        inner.ready_l.clear();
+        inner.ready_r.clear();
+        inner.resampler_l.reset();
+        inner.resampler_r.reset();
         self.live.store(false, Ordering::SeqCst);
         self.far.store(0f32.to_bits(), Ordering::SeqCst);
     }
@@ -211,31 +245,54 @@ impl Playout {
         let mut guard = locked(&self.inner);
         let inner = &mut *guard;
         let frames = out.len() / channels;
-        if inner.resampler.rates().1 != rate {
-            inner.resampler = Resampler::new(RATE, rate);
-            inner.ready.clear();
+        if inner.resampler_l.rates().1 != rate {
+            inner.resampler_l = Resampler::new(RATE, rate);
+            inner.resampler_r = Resampler::new(RATE, rate);
+            inner.ready_l.clear();
+            inner.ready_r.clear();
         }
         let mut power = 0.0f32;
-        if inner.resampler.same() {
+        if inner.resampler_l.same() {
             inner.blend(frames, master);
-            for (frame, voice) in out.chunks_exact_mut(channels).zip(&inner.mix) {
-                power += voice * voice;
-                for sample in frame {
-                    *sample += voice;
+            for (frame, (&l, &r)) in out
+                .chunks_exact_mut(channels)
+                .zip(inner.mix_l.iter().zip(&inner.mix_r))
+            {
+                let mono = 0.5 * (l + r);
+                power += 0.5 * (l * l + r * r);
+                if channels == 1 {
+                    frame[0] += mono;
+                } else {
+                    frame[0] += l;
+                    frame[1] += r;
+                    for sample in &mut frame[2..] {
+                        *sample += mono;
+                    }
                 }
             }
         } else {
-            while inner.ready.len() < frames {
+            while inner.ready_l.len() < frames {
                 inner.blend(FRAME, master);
-                inner.fresh.clear();
-                inner.resampler.process(&inner.mix, &mut inner.fresh);
-                inner.ready.extend(inner.fresh.iter());
+                inner.fresh_l.clear();
+                inner.fresh_r.clear();
+                inner.resampler_l.process(&inner.mix_l, &mut inner.fresh_l);
+                inner.resampler_r.process(&inner.mix_r, &mut inner.fresh_r);
+                inner.ready_l.extend(inner.fresh_l.iter());
+                inner.ready_r.extend(inner.fresh_r.iter());
             }
             for frame in out.chunks_exact_mut(channels) {
-                let voice = inner.ready.pop_front().unwrap_or(0.0);
-                power += voice * voice;
-                for sample in frame {
-                    *sample += voice;
+                let l = inner.ready_l.pop_front().unwrap_or(0.0);
+                let r = inner.ready_r.pop_front().unwrap_or(0.0);
+                let mono = 0.5 * (l + r);
+                power += 0.5 * (l * l + r * r);
+                if channels == 1 {
+                    frame[0] += mono;
+                } else {
+                    frame[0] += l;
+                    frame[1] += r;
+                    for sample in &mut frame[2..] {
+                        *sample += mono;
+                    }
                 }
             }
         }
@@ -243,9 +300,11 @@ impl Playout {
         self.far.store(level.to_bits(), Ordering::SeqCst);
         // Everyone fell silent and all of it has played: nothing until the next frame comes.
         if inner.speakers.values().all(|s| s.muted || s.jitter.idle())
-            && inner.ready.iter().all(|s| *s == 0.0)
+            && inner.ready_l.iter().all(|s| *s == 0.0)
+            && inner.ready_r.iter().all(|s| *s == 0.0)
         {
-            inner.ready.clear();
+            inner.ready_l.clear();
+            inner.ready_r.clear();
             self.live.store(false, Ordering::SeqCst);
             self.far.store(0f32.to_bits(), Ordering::SeqCst);
             for speaker in inner.speakers.values_mut() {
@@ -258,10 +317,12 @@ impl Playout {
 }
 
 impl Inner {
-    /// The next `frames` samples of everyone together, at 48 kHz, into `mix`.
+    /// The next `frames` samples of everyone together, at 48 kHz, into `mix_l` & `mix_r`.
     fn blend(&mut self, frames: usize, master: f32) {
-        self.mix.clear();
-        self.mix.resize(frames, 0.0);
+        self.mix_l.clear();
+        self.mix_l.resize(frames, 0.0);
+        self.mix_r.clear();
+        self.mix_r.resize(frames, 0.0);
         self.voice.clear();
         self.voice.resize(frames, 0.0);
         for speaker in self.speakers.values_mut() {
@@ -271,22 +332,37 @@ impl Inner {
                 continue;
             }
             speaker.jitter.pull(&mut self.voice);
+            let effective = speaker.gain * speaker.spatial_gain;
+            let pan = speaker.pan.clamp(-1.0, 1.0);
+            let gain_l = (1.0 - pan.max(0.0)).sqrt();
+            let gain_r = (1.0 + pan.min(0.0)).sqrt();
             // Each voice under full scale by itself, however far it is turned up: a loud
             // friend is loud, never broken.
-            for (sum, voice) in self.mix.iter_mut().zip(&self.voice) {
-                *sum += soft_limit(voice * speaker.gain);
+            for ((sum_l, sum_r), &voice) in self
+                .mix_l
+                .iter_mut()
+                .zip(self.mix_r.iter_mut())
+                .zip(&self.voice)
+            {
+                let limited = soft_limit(voice * effective);
+                *sum_l += limited * gain_l;
+                *sum_r += limited * gain_r;
             }
-            speaker.level = (speaker.jitter.level() * speaker.gain).min(1.0);
+            speaker.level = (speaker.jitter.level() * effective).min(1.0);
             speaker.talking = speaker.jitter.talking();
         }
-        for sum in &mut self.mix {
-            *sum = soft_limit(*sum * master);
+        for (sum_l, sum_r) in self.mix_l.iter_mut().zip(self.mix_r.iter_mut()) {
+            *sum_l = soft_limit(*sum_l * master);
+            *sum_r = soft_limit(*sum_r * master);
         }
     }
 }
 
 /// Where the microphone's coded frames go: each is a whole [`Up::Frame`] message.
 pub type Sink = Box<dyn Fn(Vec<u8>) + Send + Sync>;
+
+/// Where raw coded Opus frames go (`(seq, flags, opus_bytes)` — `opus_bytes` is empty on `END`).
+pub type RawFrameSink = Box<dyn Fn(u16, u8, &[u8]) + Send + Sync>;
 
 /// How the microphone is treated.
 #[derive(Clone, Default)]
@@ -325,8 +401,18 @@ pub struct CapturePipe {
 }
 
 impl CapturePipe {
-    /// Starts the microphone's thread; `sink` gets each coded frame.
+    /// Starts the microphone's thread; `sink` gets each coded [`Up::Frame`] message.
     pub fn start(sink: Sink, options: CaptureOptions) -> std::io::Result<Self> {
+        Self::start_raw(
+            Box::new(move |seq, flags, opus| {
+                sink(Up::Frame { seq, flags, opus }.encode());
+            }),
+            options,
+        )
+    }
+
+    /// Starts the microphone's thread; `sink` gets each raw coded Opus frame (`opus` is empty on `END`).
+    pub fn start_raw(sink: RawFrameSink, options: CaptureOptions) -> std::io::Result<Self> {
         let shared = Arc::new(Shared {
             input: Mutex::new(Input {
                 samples: VecDeque::new(),
@@ -396,7 +482,7 @@ impl Drop for CapturePipe {
 }
 
 /// The microphone's thread: clean, find the speech, code it, send it.
-fn run(shared: &Shared, sink: &Sink, options: &CaptureOptions) {
+fn run(shared: &Shared, sink: &RawFrameSink, options: &CaptureOptions) {
     let Ok(mut encoder) = Encoder::new() else {
         return;
     };
@@ -410,14 +496,7 @@ fn run(shared: &Shared, sink: &Sink, options: &CaptureOptions) {
     let send = |encoder: &mut Encoder, frame: &[f32; FRAME], flags: u8, seq: &mut u16| {
         let mut packet = [0u8; MAX_PACKET];
         if let Ok(n) = encoder.encode(frame, &mut packet) {
-            sink(
-                Up::Frame {
-                    seq: *seq,
-                    flags,
-                    opus: &packet[..n],
-                }
-                .encode(),
-            );
+            sink(*seq, flags, &packet[..n]);
             *seq = seq.wrapping_add(1);
         }
     };
@@ -472,14 +551,7 @@ fn run(shared: &Shared, sink: &Sink, options: &CaptureOptions) {
                 Verdict::End => {
                     talking = false;
                     shared.speaking.store(false, Ordering::SeqCst);
-                    sink(
-                        Up::Frame {
-                            seq,
-                            flags: END,
-                            opus: &[],
-                        }
-                        .encode(),
-                    );
+                    sink(seq, END, &[]);
                     seq = seq.wrapping_add(1);
                 }
                 Verdict::Silent => {
@@ -494,14 +566,7 @@ fn run(shared: &Shared, sink: &Sink, options: &CaptureOptions) {
     }
     // The microphone went off in the middle of a word: the listeners are told it ended.
     if talking {
-        sink(
-            Up::Frame {
-                seq,
-                flags: END,
-                opus: &[],
-            }
-            .encode(),
-        );
+        sink(seq, END, &[]);
     }
     shared.speaking.store(false, Ordering::SeqCst);
     shared.level.store(0f32.to_bits(), Ordering::SeqCst);

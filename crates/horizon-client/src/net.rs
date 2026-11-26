@@ -931,6 +931,12 @@ fn receive_play(
             play::Clientbound::CustomPayload(p) if p.channel == horizon_voice::wire::CHANNEL => {
                 crate::voice_net::received(&p.data);
             }
+            // Simple Voice Chat plugin channels (`voicechat:*`).
+            play::Clientbound::CustomPayload(p)
+                if p.channel.starts_with(horizon_voice::svc::CHANNEL_PREFIX) =>
+            {
+                crate::voice_net::svc_received(&p.channel, p.data);
+            }
             other => {
                 if send.send(Event::Packet(Box::new(other))).is_err() {
                     return Ok(Reason::plain("Disconnected"));

@@ -8,8 +8,11 @@
 //! The only file that names the codec's crate: another build of Opus changes this file alone.
 use crate::{FRAME, RATE};
 
-/// The most a coded frame takes: under the size the game's connection would compress.
+/// The most a coded frame takes on Starling's own wire: under the size the game's connection would compress.
 pub const MAX_PACKET: usize = 220;
+/// The largest incoming Opus frame accepted by the decoder (Simple Voice Chat servers in AUDIO
+/// mode or higher bitrates can send frames up to 1024 bytes).
+pub const MAX_DECODE_PACKET: usize = 1024;
 /// Bits a second, on average.
 pub const BITRATE: i32 = 32_000;
 /// The encoder's effort, 0 to 10: past 5 the gain is small and the battery pays for it.
@@ -77,10 +80,9 @@ impl Decoder {
         Ok(Self(opus::Decoder::new(RATE, opus::Channels::Mono)?))
     }
 
-    /// Decodes one coded frame into `out`. A packet that isn't one frame of 20 ms is refused
-    /// (nothing this game sends).
+    /// Decodes one coded frame into `out`. A packet that isn't one frame of 20 ms is refused.
     pub fn decode(&mut self, packet: &[u8], out: &mut [f32; FRAME]) -> Result<()> {
-        if packet.is_empty() || packet.len() > MAX_PACKET {
+        if packet.is_empty() || packet.len() > MAX_DECODE_PACKET {
             return Err(Error(format!("a frame of {} bytes", packet.len())));
         }
         match self.0.decode_float(packet, out, false)? {

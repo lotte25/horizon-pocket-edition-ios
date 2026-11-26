@@ -42,6 +42,8 @@ pub struct Link {
     /// Where the others' voices go, while voice chat is on here.
     playout: Mutex<Option<Arc<Playout>>>,
     told: Mutex<Vec<Told>>,
+    /// Raw inbound Simple Voice Chat (`voicechat:*`) TCP plugin messages waiting for the game.
+    svc_in: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 thread_local! {
@@ -73,6 +75,15 @@ pub fn received(data: &[u8]) {
     });
 }
 
+/// A play custom payload on a Simple Voice Chat (`voicechat:*`) channel, as it arrives.
+pub fn svc_received(channel: &str, data: Vec<u8>) {
+    HERE.with(|here| {
+        if let Some(link) = here.borrow().as_ref() {
+            link.push_svc(channel, data);
+        }
+    });
+}
+
 impl Link {
     /// The host carries voices this game can speak.
     pub fn offered(&self) -> bool {
@@ -87,6 +98,18 @@ impl Link {
     /// What the host said since the last call, in order.
     pub fn take(&self) -> Vec<Told> {
         std::mem::take(&mut *self.told.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Simple Voice Chat (`voicechat:*`) TCP payloads received since the last call.
+    pub fn take_svc(&self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut *self.svc_in.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn push_svc(&self, channel: &str, data: Vec<u8>) {
+        let mut waiting = self.svc_in.lock().unwrap_or_else(|e| e.into_inner());
+        if waiting.len() < 256 {
+            waiting.push((channel.to_owned(), data));
+        }
     }
 
     fn receive(&self, data: &[u8]) {
@@ -137,8 +160,13 @@ impl Sender {
     /// Sends one message (`horizon_voice::wire::Up`, encoded). Dropped when the connection is
     /// gone or back in configuration, as any play packet is.
     pub fn send(&self, data: Vec<u8>) {
+        self.send_custom(CHANNEL, data);
+    }
+
+    /// Sends a play `CustomPayload` on an arbitrary plugin channel (e.g. `voicechat:*`).
+    pub fn send_custom(&self, channel: &str, data: Vec<u8>) {
         let packet = play::Serverbound::CustomPayload(CustomPayload {
-            channel: CHANNEL.into(),
+            channel: channel.into(),
             data,
         });
         let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());

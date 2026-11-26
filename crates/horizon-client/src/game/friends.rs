@@ -253,6 +253,9 @@ impl Game<'_> {
     /// Play with Friends. The world is paused under it in singleplayer, so
     /// new codes and sessions are read while it is drawn.
     pub(super) fn draw_friends_screen(&mut self, batch: &mut HudBatch) {
+        if self.voice.page_open() {
+            return self.draw_voice_page(batch);
+        }
         // A shared world has its own: who hosts, Give Host, Ask to Host.
         if self.shared_active() {
             return self.draw_shared_screen(batch);
@@ -265,6 +268,9 @@ impl Game<'_> {
         friends_screen::draw(batch, &self.gui.atlas, self.cursor, &view, true);
     }
     pub(super) fn friends_screen_click(&mut self) {
+        if self.voice.page_open() {
+            return self.voice_page_click();
+        }
         if self.shared_active() {
             return self.shared_screen_click();
         }

@@ -998,7 +998,7 @@ impl Game<'_> {
             self.touch.context = context;
             self.touch.wanted = matches!(
                 context,
-                Some("chat" | "sign" | "book" | "command" | "mod" | "catalog")
+                Some("chat" | "sign" | "book" | "command" | "mod" | "catalog" | "voice")
             );
             // The finger that opened it lifts on the new screen: that is not a tap beside its field.
             if self.touch.wanted {
@@ -1167,6 +1167,9 @@ impl Game<'_> {
         } else if self.screen == Screen::WorldOptions && self.world_options_typing() {
             // The open world's game rules and the LAN port: boxes of digits.
             Some("world")
+        } else if self.voice_typing() {
+            // Voice chat group name / password text fields.
+            Some("voice")
         } else if self.mod_screen_typing() {
             // A text field of a mod's own screen (game/mod_keys.rs): the mod says when.
             Some("mod")
@@ -1195,6 +1198,7 @@ impl Game<'_> {
             "options" => Some(self.ui.options.text_field_at(cursor.0, cursor.1)),
             // The tap's click focused the box under it, or none.
             "world" => Some(self.world_options_typing()),
+            "voice" => Some(self.voice_typing()),
             "dialog" => Some(self.dialog_typing()),
             // The mod says so only while the last tap was on one of its fields.
             "mod" => Some(true),
