@@ -2097,7 +2097,9 @@ impl UiResources {
                     horizon_client::gfx::panorama::Faces::load(root, defaults)
                 })
             });
-            let mod_image = !horizon_client::mod_api::mods().is_empty();
+            // Always allocate the mod image slot (4 MiB) so horizon-mixins native mods
+            // (e.g. World Map) as well as mod_api mods can upload HUD images via native_mod_image.
+            let mod_image = true;
             let atlas = startup::time("ui.atlas", || {
                 HudAtlas::build_over_with_image(root, defaults, mod_image)
             });
@@ -16014,7 +16016,8 @@ impl Game<'_> {
         let depth_far =
             horizon_client::camera::depth_far(terrain_distance, self.settings.cloud_range);
         // Only native mods read it: no matrices or allocation per frame without one.
-        let mods_read_camera = !horizon_client::mod_api::mods().is_empty();
+        let mods_read_camera =
+            !horizon_client::mod_api::mods().is_empty() || self.has_native_mods();
         self.native_camera_frame = (mods_read_camera && !title).then(|| {
             let partial = camera_alpha as f32;
             horizon_client::mod_api::NativeCamera {

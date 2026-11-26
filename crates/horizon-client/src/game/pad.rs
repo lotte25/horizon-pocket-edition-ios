@@ -374,11 +374,11 @@ impl Game<'_> {
             }
             gamepad::WAYPOINTS | gamepad::ADD_WAYPOINT => {
                 if down {
-                    self.mod_key_tap(if action == gamepad::WAYPOINTS {
-                        &super::mod_keys::WAYPOINTS
+                    if action == gamepad::WAYPOINTS {
+                        self.mod_key_tap_waypoints();
                     } else {
-                        &super::mod_keys::ADD_WAYPOINT
-                    });
+                        self.mod_key_tap_add_waypoint();
+                    }
                 }
                 Ok(())
             }

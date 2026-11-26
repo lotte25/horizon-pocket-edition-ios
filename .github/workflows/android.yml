@@ -16,7 +16,7 @@ on:
       mods:
         description: "Native mods to build in (ids, spaces or commas; empty = no native mods)"
         type: string
-        default: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud treefall waymap zoom"
+        default: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud treefall worldmap zoom"
       variant:
         description: "APK variant: dev (side-by-side install) or release"
         type: choice

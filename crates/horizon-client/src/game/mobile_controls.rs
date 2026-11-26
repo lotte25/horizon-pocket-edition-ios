@@ -311,7 +311,7 @@ impl Game<'_> {
                 .is_some_and(|p| p.flying || p.swimming || p.spectator)
                 || self.riding.is_some();
             let zoom_mod = self.mod_key_ready(super::mod_keys::ZOOM.mod_id);
-            let waypoint_mod = self.mod_key_ready(super::mod_keys::WAYPOINTS.mod_id);
+            let waypoint_mod = self.waypoint_mod_ready();
             let tc = &mut self.mobile.controls;
             tc.zoom_available = zoom_mod;
             tc.waypoints_available = waypoint_mod;
@@ -385,7 +385,7 @@ impl Game<'_> {
         let (voice_on, mic_live) = (self.voice.enabled(), self.voice.mic_on());
         // The mods' buttons: there while the mod is in the app and on (game/mod_keys.rs).
         let zoom_mod = self.mod_key_ready(super::mod_keys::ZOOM.mod_id);
-        let waypoint_mod = self.mod_key_ready(super::mod_keys::WAYPOINTS.mod_id);
+        let waypoint_mod = self.waypoint_mod_ready();
         let tc = &mut self.mobile.controls;
         tc.zoom_available = zoom_mod;
         tc.waypoints_available = waypoint_mod;
@@ -477,10 +477,10 @@ impl Game<'_> {
         }
         self.mod_key_hold("touch", &super::mod_keys::ZOOM, zoom);
         if waypoints && !in_menu {
-            self.mod_key_tap(&super::mod_keys::WAYPOINTS);
+            self.mod_key_tap_waypoints();
         }
         if add_waypoint && !in_menu {
-            self.mod_key_tap(&super::mod_keys::ADD_WAYPOINT);
+            self.mod_key_tap_add_waypoint();
         }
         if settings {
             self.mobile.ui.floating_menu = false;
@@ -793,10 +793,10 @@ impl Game<'_> {
                 self.voice_toggle_mic();
             }
             if ev.waypoints {
-                self.mod_key_tap(&super::mod_keys::WAYPOINTS);
+                self.mod_key_tap_waypoints();
             }
             if ev.add_waypoint {
-                self.mod_key_tap(&super::mod_keys::ADD_WAYPOINT);
+                self.mod_key_tap_add_waypoint();
             }
             if (ev.pause || ev.inventory || ev.chat) && self.pad_in_menu() {
                 self.mobile.classic_pe.more_open = false;
@@ -2178,7 +2178,8 @@ impl Game<'_> {
         if t.phase == TouchPhase::Started && self.screen == Screen::Options {
             // Starling tracks list and slider presses through its window events.
         }
-        let track = self.on_scrollbar([t.location.x as f32, t.location.y as f32]);
+        let track = self.on_scrollbar([t.location.x as f32, t.location.y as f32])
+            || self.native_mod_screen() == Some("worldmap");
         let direct = self.mobile.ui.direct_pointer(t.id, p, t.phase, track);
         self.handle_window_event(
             events,

@@ -1797,11 +1797,31 @@ impl Game<'_> {
     ) -> bool {
         self.signed_chat_line(content, source, None, ChatTrust::Secure)
     }
+    /// Hook point for native mods inspecting or decorating incoming chat lines.
+    fn chat_received(&self, line: &mut horizon_client::text::Text) {
+        let _ = line;
+    }
+    /// Nearby live, visible remote players in the current level (`(name, [x, y, z])`).
+    #[allow(dead_code)]
+    pub(super) fn native_remote_players(&self) -> Vec<(String, [f64; 3])> {
+        let Some(r) = self.remote.as_ref() else {
+            return Vec::new();
+        };
+        self.mobs
+            .iter()
+            .filter(|m| m.health > 0.0 && !m.invisible && m.id as i32 != r.entity_id)
+            .filter_map(|m| {
+                r.level_player_names
+                    .get(&(m.id as i32))
+                    .map(|name| (name.clone(), [m.position.x, m.position.y, m.position.z]))
+            })
+            .collect()
+    }
     /// `chat_line` of a player message, keeping its signature for a
     /// deletion (`GuiMessage.signature`).
     fn signed_chat_line(
         &mut self,
-        content: horizon_client::text::Text,
+        mut content: horizon_client::text::Text,
         source: horizon_client::chat::ChatSource,
         signature: Option<Signature>,
         trust: ChatTrust,
@@ -1813,6 +1833,7 @@ impl Game<'_> {
         if !self.ui.chat.shows(source) {
             return false;
         }
+        self.chat_received(&mut content);
         let plain = content.plain();
         let focused = self.screen == Screen::Chat;
         if source == horizon_client::chat::ChatSource::Player {

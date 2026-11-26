@@ -35,6 +35,18 @@ pub(super) const ADD_WAYPOINT: ModKey = ModKey {
     name: "add",
     default: "key.keyboard.n",
 };
+/// World Map: open the full-screen map (M).
+pub(super) const WORLDMAP_OPEN: ModKey = ModKey {
+    mod_id: "worldmap",
+    name: "open",
+    default: "key.keyboard.m",
+};
+/// World Map: create a new waypoint here (B).
+pub(super) const WORLDMAP_ADD_WAYPOINT: ModKey = ModKey {
+    mod_id: "worldmap",
+    name: "waypoint",
+    default: "key.keyboard.b",
+};
 
 /// What is held, and which of the mods are in this app.
 #[derive(Default)]
@@ -50,15 +62,48 @@ pub(super) struct ModKeys {
 }
 
 impl Game<'_> {
-    /// Whether native mod `id` is in this app and left on in Options > Mods.
-    pub(super) fn mod_key_ready(&mut self, id: &str) -> bool {
+    /// Whether any horizon-mixins native mod is compiled into this app.
+    pub(super) fn has_native_mods(&mut self) -> bool {
         if self.mod_keys.built.is_none() {
             let mut mods = Vec::new();
             self.native_mods(&mut mods);
             self.mod_keys.built = Some(mods.into_iter().map(|m| m.id).collect());
         }
+        self.mod_keys
+            .built
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
+    /// Whether native mod `id` is in this app and left on in Options > Mods.
+    pub(super) fn mod_key_ready(&mut self, id: &str) -> bool {
+        let _ = self.has_native_mods();
         let built = self.mod_keys.built.as_ref();
         built.is_some_and(|ids| ids.iter().any(|m| m == id)) && self.native_on(id)
+    }
+
+    /// Whether either World Map or Waymap is installed and enabled.
+    #[allow(dead_code)]
+    pub(super) fn waypoint_mod_ready(&mut self) -> bool {
+        self.mod_key_ready(WORLDMAP_OPEN.mod_id) || self.mod_key_ready(WAYPOINTS.mod_id)
+    }
+
+    /// Open the World Map if enabled, else Waymap's waypoint list.
+    pub(super) fn mod_key_tap_waypoints(&mut self) {
+        if self.mod_key_ready(WORLDMAP_OPEN.mod_id) {
+            self.mod_key_tap(&WORLDMAP_OPEN);
+        } else {
+            self.mod_key_tap(&WAYPOINTS);
+        }
+    }
+
+    /// Add a waypoint via World Map if enabled, else Waymap.
+    pub(super) fn mod_key_tap_add_waypoint(&mut self) {
+        if self.mod_key_ready(WORLDMAP_ADD_WAYPOINT.mod_id) {
+            self.mod_key_tap(&WORLDMAP_ADD_WAYPOINT);
+        } else {
+            self.mod_key_tap(&ADD_WAYPOINT);
+        }
     }
 
     /// The mod whose own screen is open (`native_mod_screen_open`) says whether the player is
