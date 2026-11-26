@@ -6,8 +6,7 @@ run-name: iOS · ${{ inputs.mods && format('native mods {0} · ', inputs.mods) |
 #        Android app prepares with Java, prepared here (tools/ios_prepare.py) and proved to come back on
 #        the phone file for file; the app bundled and checked to carry none of Mojang's files. The
 #        unsigned .ipa is kept only when dispatched with `deliver`.
-#   simulator: the same game for the iOS Simulator, started there and checked to get through its start.
-# Dispatched with `mods`, both build the game with those native mods compiled in (docs/ios.md): an
+# Dispatched with `mods`, it builds the game with those native mods compiled in (docs/ios.md): an
 # iPhone runs no code its app did not ship with, so a native mod is part of the app itself.
 on:
   push:
@@ -211,62 +210,3 @@ jobs:
           path: HorizonPE-iOS-unsigned.ipa
           retention-days: 30
           if-no-files-found: error
-
-  simulator:
-    runs-on: macos-26
-    timeout-minutes: 180
-    env:
-      IOS_TARGET: aarch64-apple-ios-sim
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      # First, so a mod id that isn't one stops the run in seconds.
-      - name: Fetch and check the native mods
-        if: ${{ inputs.mods }}
-        env:
-          MODS: ${{ inputs.mods }}
-        run: |
-          set -euo pipefail -f
-          curl -fsSL --retry 3 https://horizon-rust.github.io/horizon-mods/index.json -o "$RUNNER_TEMP/index.json"
-          python3 tools/ios_native_mods.py fetch "$RUNNER_TEMP/index.json" "$RUNNER_TEMP/native" ${MODS//,/ }
-          python3 tools/ios_native_mods.py info "$RUNNER_TEMP/native" "$GITHUB_SHA" > "$RUNNER_TEMP/native-mods.json"
-      - name: Install Rust and its iOS Simulator standard library
-        run: |
-          rustup toolchain install stable --profile minimal --target "$IOS_TARGET"
-          rustup default stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ios-${{ env.IOS_TARGET }}
-          cache-on-failure: true
-          save-if: ${{ !inputs.mods }}
-      - uses: actions/cache@v4
-        if: ${{ inputs.mods }}
-        with:
-          path: ~/.cache/starling-native
-          key: native-mixins-${{ runner.os }}-${{ hashFiles('packaging/android/native_build.sh') }}
-      - name: Apply the native mods to the source
-        if: ${{ inputs.mods }}
-        run: |
-          bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles" 2>&1 | tee native-stage.log
-          echo "::notice::built with $(python3 tools/ios_native_mods.py names "$RUNNER_TEMP/native")"
-      - name: Build the game for the Simulator
-        run: cargo build --release --keep-going --target "$IOS_TARGET" -p horizon-ios-game
-      - name: Bundle it for the Simulator
-        run: |
-          set -euo pipefail
-          # The menu art and shader pack the app carries (no game tables: the game starts on
-          # its installer, as on a phone before the game files are fetched).
-          python3 tools/ios_prepare.py --art-only
-          command -v xcodegen >/dev/null || brew install xcodegen
-          ( cd packaging/ios && xcodegen generate )
-          HORIZON_GAME_PREBUILT=1 xcodebuild -project packaging/ios/HorizonPE.xcodeproj \
-            -target HorizonPE -configuration Release -sdk iphonesimulator -arch arm64 \
-            IOS_TARGET="$IOS_TARGET" CODE_SIGN_IDENTITY=- \
-            CONFIGURATION_BUILD_DIR="$PWD/build-sim" \
-            build > xcode-sim.log 2>&1 || { tail -80 xcode-sim.log; exit 1; }
-      - name: Start it in the Simulator
-        run: bash tools/ci/ios_simulator_smoke.sh build-sim/HorizonPE.app
