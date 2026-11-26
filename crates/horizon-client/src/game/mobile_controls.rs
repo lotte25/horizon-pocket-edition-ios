@@ -749,17 +749,28 @@ impl Game<'_> {
                 self.selected = slot;
             }
             if ev.pause {
-                self.pad.touch_tap(horizon_client::gamepad::Button::Start);
+                mobile_platform::hide();
+                if let Err(e) = self.pad_back() {
+                    log::warn!("Classic PE pause: {e}");
+                }
             }
-            if ev.inventory {
-                self.pad.touch_tap(horizon_client::gamepad::Button::North);
+            if ev.inventory
+                && let Err(e) = self.key_pressed(KeyCode::KeyE)
+            {
+                log::warn!("Classic PE inventory: {e}");
             }
             if ev.chat {
-                self.pad
-                    .touch_tap(horizon_client::gamepad::Button::DPadRight);
+                if let Err(e) = self.key_pressed(KeyCode::KeyT) {
+                    log::warn!("Classic PE chat: {e}");
+                }
+                if self.screen == Screen::Chat {
+                    self.android_show_keyboard();
+                }
             }
-            if ev.perspective {
-                self.pad.touch_tap(horizon_client::gamepad::Button::DPadUp);
+            if ev.perspective
+                && let Err(e) = self.key_pressed(KeyCode::F5)
+            {
+                log::warn!("Classic PE perspective: {e}");
             }
             if ev.debug {
                 self.debug_key(KeyCode::F3, KeyAction::Press);
@@ -773,8 +784,10 @@ impl Game<'_> {
                 }
                 let _ = self.mapped_key(KeyCode::Tab, down, false);
             }
-            if ev.drop {
-                self.pad.touch_tap(horizon_client::gamepad::Button::East);
+            if ev.drop
+                && let Err(e) = self.key_pressed(KeyCode::KeyQ)
+            {
+                log::warn!("Classic PE drop: {e}");
             }
             if ev.voice {
                 self.voice_toggle_mic();
@@ -784,6 +797,11 @@ impl Game<'_> {
             }
             if ev.add_waypoint {
                 self.mod_key_tap(&super::mod_keys::ADD_WAYPOINT);
+            }
+            if (ev.pause || ev.inventory || ev.chat) && self.pad_in_menu() {
+                self.mobile.classic_pe.more_open = false;
+                self.mobile.classic_pe.reset_active();
+                self.android_sync_pointer();
             }
             if ev.look_gui != [0.0, 0.0] {
                 let delta = [

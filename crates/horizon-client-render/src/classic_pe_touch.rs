@@ -719,9 +719,6 @@ struct Finger {
 /// Multi-touch gesture recognizer for classic Bedrock / Pocket Edition gameplay.
 #[derive(Clone, Debug, Default)]
 pub struct ClassicPeTouches {
-    /// When `true`, sliding a finger after hold-to-mine begins moves the touch circle & target
-    /// across adjacent blocks instead of turning the camera.
-    pub touch_interact: bool,
     last_forward_tap: Option<f64>,
     last_world_pos: Option<(f32, f32)>,
     fingers: Vec<Finger>,
@@ -884,13 +881,9 @@ impl ClassicPeTouches {
             }
             FingerKind::Button(_) => {}
             FingerKind::World { dragged, mining } => {
-                if self.touch_interact && *mining {
-                    f.last = at;
-                    self.last_world_pos = Some(at);
-                    return out;
-                }
                 let (dx, dy) = (at.0 - f.start.0, at.1 - f.start.1);
-                if !*dragged && dx.hypot(dy) > SLOP {
+                let threshold = if *mining { 3.0 } else { SLOP };
+                if !*dragged && dx.hypot(dy) > threshold {
                     *dragged = true;
                 }
                 if *dragged {
@@ -1173,7 +1166,6 @@ impl ClassicPeState {
             return ev;
         }
         let layout = bedrock_layout(size.0, size.1, &self.config, opts);
-        self.touches.touch_interact = !self.config.split_controls;
         let now = self.now();
         let outs = match phase {
             TouchPhaseKind::Started => self.touches.start(id, at, now, &layout),
@@ -1236,7 +1228,6 @@ impl ClassicPeState {
                     }
                     ClassicPeControl::ToggleSplitControls => {
                         self.config.split_controls = !self.config.split_controls;
-                        self.touches.touch_interact = !self.config.split_controls;
                         self.tap_pulse = None;
                         self.break_flash = None;
                         self.tap_aim_until = None;
@@ -2594,27 +2585,24 @@ mod tests {
     }
 
     #[test]
-    fn touch_interact_hold_slides_target_without_turning_camera() {
+    fn touch_interact_hold_turns_camera_while_mining() {
         let l = bedrock_layout(
             640.0,
             320.0,
             &ClassicPeConfig::default(),
             LayoutOptions::default(),
         );
-        let mut t = ClassicPeTouches {
-            touch_interact: true,
-            ..Default::default()
-        };
+        let mut t = ClassicPeTouches::default();
         let p0 = (320.0, 160.0);
         assert!(t.start(7, p0, 1.0, &l).is_empty());
         assert!(t.pending_hold_pos(1.20).is_some());
         let out = t.frame(1.40);
         assert_eq!(out, vec![TouchOut::MineStart(p0)]);
 
-        // Sliding while mining moves active_mine_pos without emitting Look.
+        // Moving while mining turns the camera AND keeps active_mine_pos tracking the finger.
         let p1 = (380.0, 145.0);
         let moved = t.moved(7, p1, &l);
-        assert!(moved.is_empty());
+        assert_eq!(moved, vec![TouchOut::Look(60.0, -15.0)]);
         assert_eq!(t.active_mine_pos(), Some(p1));
         assert_eq!(t.end_at(7, p1), vec![TouchOut::MineEnd]);
     }
