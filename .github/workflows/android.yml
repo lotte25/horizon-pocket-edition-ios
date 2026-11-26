@@ -118,7 +118,8 @@ jobs:
             echo "No native mods requested; building plain Android APK."
             exit 0
           fi
-          curl -fsSL --retry 3 https://horizon-rust.github.io/horizon-mods/index.json -o "$RUNNER_TEMP/index.json"
+          # Built-in native mods live locally under native-mods/; no external registry fetch needed.
+          printf '{"projects":[]}\n' > "$RUNNER_TEMP/index.json"
           python3 tools/ios_native_mods.py fetch "$RUNNER_TEMP/index.json" "$RUNNER_TEMP/native" "${ids[@]}"
           bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles"
       - name: Build, pack, and sign the .apk
