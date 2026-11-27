@@ -93,10 +93,11 @@ impl Game<'_> {
                 .chain(self.offhand.as_ref())
                 .any(|s| {
                     !horizon_client::android_controls::item_uses_on_tap(&s.item)
-                        && self
-                            .items()
-                            .get(&s.item)
-                            .is_some_and(super::remote::item_has_use)
+                        && self.items().get(&s.item).is_some_and(|info| {
+                            // Shields are raised via the dedicated Shield button (or crouch when
+                            // configured), never by hijacking world hold-to-mine.
+                            info.blocks_attacks.is_none() && super::remote::item_has_use(info)
+                        })
                 })
     }
     /// iOS: a key from the window's keyboard for a field that has no key path of its own, which
@@ -251,11 +252,14 @@ impl Game<'_> {
             .as_ref()
             .is_some_and(|p| p.flying || p.swimming || p.spectator)
             || self.riding.is_some();
+        let shield_available =
+            self.mobile.controls.shield_available && self.mobile.controls.settings.shield_button;
         let zoom_available = self.mobile.controls.zoom_available;
         let waypoints_available = self.mobile.controls.waypoints_available;
         let voice_available = self.voice.enabled();
         self.mobile.classic_pe.layout_options(
             vertical,
+            shield_available,
             zoom_available,
             waypoints_available,
             voice_available,
@@ -313,6 +317,8 @@ impl Game<'_> {
             let zoom_mod = self.mod_key_ready(super::mod_keys::ZOOM.mod_id);
             let waypoint_mod = self.waypoint_mod_ready();
             let tc = &mut self.mobile.controls;
+            let shield_button = tc.settings.shield_button;
+            tc.shield_available = shield_available;
             tc.zoom_available = zoom_mod;
             tc.waypoints_available = waypoint_mod;
             tc.in_menu = in_menu;
@@ -336,12 +342,12 @@ impl Game<'_> {
                 item_use,
                 entity_use,
                 shield_available,
+                shield_button,
                 in_menu || self.mobile.ui.floating_menu,
                 self.focused,
             );
             self.mobile.touch_aim = upd.aim_norm;
-            self.mobile.touch_shield =
-                shown && !in_menu && shield_available && upd.sneaking && !vertical;
+            self.mobile.touch_shield = shown && !in_menu && upd.shield_held;
             let lost = upd.sneaking && !self.keys.contains(&KeyCode::ShiftLeft);
             if upd.sneaking != self.mobile.classic_pe_sneaking || lost {
                 let pressed = upd.sneaking && !self.mobile.classic_pe_sneaking;

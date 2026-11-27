@@ -61,6 +61,9 @@ pub enum ClassicPeControl {
     LeftClick,
     /// Optional dedicated Use button (toggled via `ATK` in the `...` drawer).
     RightClick,
+    /// Dedicated hold-to-activate Shield button on the right side (shown when a shield is equipped
+    /// and "Raise shield with: Shield button" is enabled).
+    Shield,
     /// Built-in Zoom mod button (left edge, gold magnifying glass when active).
     Zoom,
     /// Built-in Waymap waypoints list button.
@@ -104,6 +107,7 @@ impl ClassicPeControl {
             Self::Inventory => Some(LayoutGroup::Inventory),
             Self::LeftClick => Some(LayoutGroup::Attack),
             Self::RightClick => Some(LayoutGroup::Use),
+            Self::Shield => Some(LayoutGroup::Shield),
             Self::Zoom => Some(LayoutGroup::Zoom),
             Self::Waypoints | Self::AddWaypoint => Some(LayoutGroup::Waypoints),
             Self::Voice => Some(LayoutGroup::Voice),
@@ -122,19 +126,21 @@ pub enum LayoutGroup {
     Inventory,
     Attack,
     Use,
+    Shield,
     Zoom,
     Waypoints,
     Voice,
 }
 
 impl LayoutGroup {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Dpad,
         Self::Jump,
         Self::TopBar,
         Self::Inventory,
         Self::Attack,
         Self::Use,
+        Self::Shield,
         Self::Zoom,
         Self::Waypoints,
         Self::Voice,
@@ -148,6 +154,7 @@ impl LayoutGroup {
             Self::Inventory => "Inventory",
             Self::Attack => "Attack",
             Self::Use => "Use",
+            Self::Shield => "Shield",
             Self::Zoom => "Zoom",
             Self::Waypoints => "Waypoints",
             Self::Voice => "Voice",
@@ -216,6 +223,8 @@ pub struct ClassicPeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_btn: Option<GroupPlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shield: Option<GroupPlacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zoom: Option<GroupPlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waypoints: Option<GroupPlacement>,
@@ -235,6 +244,7 @@ impl Default for ClassicPeConfig {
             inventory: None,
             attack: None,
             use_btn: None,
+            shield: None,
             zoom: None,
             waypoints: None,
             voice: None,
@@ -279,6 +289,7 @@ impl ClassicPeConfig {
         self.inventory = self.inventory.and_then(GroupPlacement::sanitized);
         self.attack = self.attack.and_then(GroupPlacement::sanitized);
         self.use_btn = self.use_btn.and_then(GroupPlacement::sanitized);
+        self.shield = self.shield.and_then(GroupPlacement::sanitized);
         self.zoom = self.zoom.and_then(GroupPlacement::sanitized);
         self.waypoints = self.waypoints.and_then(GroupPlacement::sanitized);
         self.voice = self.voice.and_then(GroupPlacement::sanitized);
@@ -300,6 +311,7 @@ impl ClassicPeConfig {
             LayoutGroup::Inventory => self.inventory,
             LayoutGroup::Attack => self.attack,
             LayoutGroup::Use => self.use_btn,
+            LayoutGroup::Shield => self.shield,
             LayoutGroup::Zoom => self.zoom,
             LayoutGroup::Waypoints => self.waypoints,
             LayoutGroup::Voice => self.voice,
@@ -315,6 +327,7 @@ impl ClassicPeConfig {
             LayoutGroup::Inventory => self.inventory = p,
             LayoutGroup::Attack => self.attack = p,
             LayoutGroup::Use => self.use_btn = p,
+            LayoutGroup::Shield => self.shield = p,
             LayoutGroup::Zoom => self.zoom = p,
             LayoutGroup::Waypoints => self.waypoints = p,
             LayoutGroup::Voice => self.voice = p,
@@ -333,6 +346,7 @@ pub struct LayoutOptions {
     pub hidden: bool,
     pub vertical_movement: bool,
     pub editing: bool,
+    pub shield_available: bool,
     pub zoom_available: bool,
     pub waypoints_available: bool,
     pub voice_available: bool,
@@ -506,6 +520,27 @@ pub fn bedrock_layout(
             None => clamp_box(default_use_cx, default_use_cy, use_s, use_s, w, h),
         };
         v.push((ClassicPeControl::RightClick, [ux, uy, use_s, use_s]));
+    }
+
+    // 5b. Dedicated hold-to-activate Shield button on the right side (when shield is equipped
+    // and separate shield button is enabled, or while editing the layout).
+    if opts.shield_available || opts.editing {
+        let sh_scale = config.scale_of(LayoutGroup::Shield);
+        let sh_s = (base_d * 0.92 * sh_scale)
+            .clamp(20.0, 48.0)
+            .min(w * 0.24)
+            .min(h * 0.26);
+        let default_sh_cx = if config.show_action_buttons || opts.editing {
+            (jx - sh_s * 0.5 - 8.0).max(sh_s / 2.0)
+        } else {
+            jx + js * 0.5
+        };
+        let default_sh_cy = (jy - sh_s * 0.5 - 8.0).max(ts + 8.0 + sh_s / 2.0);
+        let [sx, sy] = match config.shield {
+            Some(p) => clamp_box(p.x * w, p.y * h, sh_s, sh_s, w, h),
+            None => clamp_box(default_sh_cx, default_sh_cy, sh_s, sh_s, w, h),
+        };
+        v.push((ClassicPeControl::Shield, [sx, sy, sh_s, sh_s]));
     }
 
     // 6. Top-middle bar: Pause, Chat, More ("...").
@@ -879,6 +914,9 @@ impl ClassicPeTouches {
                     }
                 }
             }
+            FingerKind::Button(ClassicPeControl::Shield) => {
+                out.push(TouchOut::Look(at.0 - f.last.0, at.1 - f.last.1));
+            }
             FingerKind::Button(_) => {}
             FingerKind::World { dragged, mining } => {
                 let (dx, dy) = (at.0 - f.start.0, at.1 - f.start.1);
@@ -1025,6 +1063,7 @@ pub struct TouchStepEvents {
 pub struct FrameUpdate {
     pub pad: PadState,
     pub sneaking: bool,
+    pub shield_held: bool,
     pub zoom_active: bool,
     pub aim_norm: Option<[f32; 2]>,
     pub holding_use: bool,
@@ -1134,6 +1173,7 @@ impl ClassicPeState {
     pub fn layout_options(
         &self,
         vertical_movement: bool,
+        shield_available: bool,
         zoom_available: bool,
         waypoints_available: bool,
         voice_available: bool,
@@ -1143,6 +1183,7 @@ impl ClassicPeState {
             hidden: self.hidden && !self.editor.active,
             vertical_movement,
             editing: self.editor.active,
+            shield_available,
             zoom_available,
             waypoints_available,
             voice_available,
@@ -1270,7 +1311,8 @@ impl ClassicPeState {
                     | ClassicPeControl::Back
                     | ClassicPeControl::Left
                     | ClassicPeControl::Right
-                    | ClassicPeControl::FlyDown => {}
+                    | ClassicPeControl::FlyDown
+                    | ClassicPeControl::Shield => {}
                 },
                 TouchOut::Release(ClassicPeControl::Zoom) => {
                     if let Some(started) = self.zoom_press_started.take() {
@@ -1327,6 +1369,7 @@ impl ClassicPeState {
         hold_uses_item: bool,
         entity_uses: bool,
         shield_available: bool,
+        shield_button: bool,
         in_menu: bool,
         focused: bool,
     ) -> FrameUpdate {
@@ -1389,9 +1432,16 @@ impl ClassicPeState {
             pad.triggers[0] = 1.0;
         }
 
-        // 3. Sneak / FlyDown (also raises shield while sneaking with a shield equipped).
+        // 3. Sneak / FlyDown and Shield raising (separate hold button when `shield_button` is on,
+        // else Bedrock-style crouch-to-shield).
         let sneaking = self.is_sneaking();
-        if sneaking && shield_available && !vertical_movement {
+        let shield_held = shield_available
+            && if shield_button {
+                self.touches.held(ClassicPeControl::Shield)
+            } else {
+                sneaking && !vertical_movement
+            };
+        if shield_held {
             pad.triggers[0] = 1.0;
         }
 
@@ -1428,6 +1478,7 @@ impl ClassicPeState {
         FrameUpdate {
             pad,
             sneaking,
+            shield_held,
             zoom_active: self.zoom_active(),
             aim_norm: self.aim_norm(),
             holding_use: self.holding_use,
@@ -1674,6 +1725,7 @@ impl ClassicPeState {
                     control,
                     ClassicPeControl::LeftClick | ClassicPeControl::RightClick
                 ) && !self.config.show_action_buttons)
+                    || (control == ClassicPeControl::Shield && !opts.shield_available)
                     || (control == ClassicPeControl::Zoom && !opts.zoom_available)
                     || (matches!(
                         control,
@@ -1834,6 +1886,7 @@ impl ClassicPeState {
 
             let is_off = match group {
                 LayoutGroup::Attack | LayoutGroup::Use => !self.config.show_action_buttons,
+                LayoutGroup::Shield => !opts.shield_available,
                 LayoutGroup::Zoom => !opts.zoom_available,
                 LayoutGroup::Waypoints => !opts.waypoints_available,
                 LayoutGroup::Voice => !opts.voice_available,
@@ -2150,6 +2203,7 @@ fn draw_bedrock_control(
         ClassicPeControl::More | ClassicPeControl::Inventory => draw_dots_icon(batch, atlas, r),
         ClassicPeControl::LeftClick => draw_sword_icon(batch, atlas, r),
         ClassicPeControl::RightClick => draw_use_icon(batch, atlas, r),
+        ClassicPeControl::Shield => draw_shield_icon(batch, atlas, r, held),
         ClassicPeControl::Zoom => draw_zoom_icon(batch, atlas, r, active),
         ClassicPeControl::Waypoints => draw_waypoint_icon(batch, atlas, r, false),
         ClassicPeControl::AddWaypoint => draw_waypoint_icon(batch, atlas, r, true),
@@ -2501,6 +2555,37 @@ fn draw_voice_icon(batch: &mut HudBatch, atlas: &HudAtlas, r: Rect, muted: bool)
     }
 }
 
+fn draw_shield_icon(batch: &mut HudBatch, atlas: &HudAtlas, r: Rect, held: bool) {
+    const SHIELD: [&str; 12] = [
+        "..########..",
+        ".##########.",
+        ".##......##.",
+        ".##..##..##.",
+        ".##..##..##.",
+        ".##.####.##.",
+        ".##..##..##.",
+        ".##..##..##.",
+        "..##....##..",
+        "...##..##...",
+        "....####....",
+        ".....##.....",
+    ];
+    let fg = if held {
+        rgba(120, 225, 255, 255)
+    } else {
+        rgba(255, 255, 255, 240)
+    };
+    shadowed_colored(r, fg, |r, color| {
+        let inner = [
+            r[0] + r[2] * 0.18,
+            r[1] + r[3] * 0.16,
+            r[2] * 0.64,
+            r[3] * 0.68,
+        ];
+        pixel_glyph(batch, atlas, inner, &SHIELD, color);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2517,6 +2602,7 @@ mod tests {
             hidden: false,
             vertical_movement: true,
             editing: false,
+            shield_available: true,
             zoom_available: true,
             waypoints_available: true,
             voice_available: true,
@@ -2547,6 +2633,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shield_button_separates_crouch_from_shield_and_is_hold_to_activate() {
+        let mut st = ClassicPeState::default();
+        let size = (480.0, 270.0);
+        let opts = st.layout_options(false, true, false, false, false);
+        let layout = bedrock_layout(size.0, size.1, &st.config, opts);
+        let shield_rect = layout
+            .iter()
+            .find(|(c, _)| *c == ClassicPeControl::Shield)
+            .expect("Shield button should be present")
+            .1;
+        // Shield button sits on the right half of the screen.
+        assert!(shield_rect[0] + shield_rect[2] / 2.0 > size.0 / 2.0);
+
+        // Crouch while holding a shield with shield_button=true: does NOT raise shield or lock out actions.
+        let sneak_pos = center(&layout, ClassicPeControl::Sneak);
+        let home = Path::new(".");
+        st.config_loaded = true;
+        st.touch_event(1, TouchPhaseKind::Started, sneak_pos, size, opts, home);
+        st.touch_event(1, TouchPhaseKind::Ended, sneak_pos, size, opts, home);
+        let upd = st.frame_update(size, 0.0, false, false, false, true, true, false, true);
+        assert!(upd.sneaking);
+        assert!(!upd.shield_held);
+        assert_eq!(upd.pad.triggers[0], 0.0);
+
+        // Hold the Shield button -> shield is raised while held, and released on finger lift (not a toggle).
+        let shield_pos = (
+            shield_rect[0] + shield_rect[2] / 2.0,
+            shield_rect[1] + shield_rect[3] / 2.0,
+        );
+        st.touch_event(2, TouchPhaseKind::Started, shield_pos, size, opts, home);
+        let held = st.frame_update(size, 0.0, false, false, false, true, true, false, true);
+        assert!(held.shield_held);
+        assert_eq!(held.pad.triggers[0], 1.0);
+
+        st.touch_event(2, TouchPhaseKind::Ended, shield_pos, size, opts, home);
+        let released = st.frame_update(size, 0.0, false, false, false, true, true, false, true);
+        assert!(!released.shield_held);
+        assert_eq!(released.pad.triggers[0], 0.0);
+        assert!(released.sneaking);
+
+        // With shield_button=false, sneaking falls back to raising shield.
+        let legacy = st.frame_update(size, 0.0, false, false, false, true, false, false, true);
+        assert!(legacy.shield_held);
+        assert_eq!(legacy.pad.triggers[0], 1.0);
     }
 
     #[test]
