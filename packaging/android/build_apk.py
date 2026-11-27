@@ -204,7 +204,16 @@ def compile_java(build_tools, android_jar, out):
     return dex / "classes.dex"
 
 
-def link_resources(aapt2, android_jar, out, assets, variant, abi=ABI):
+def link_resources(
+    aapt2,
+    android_jar,
+    out,
+    assets,
+    variant,
+    abi=ABI,
+    version_name=VERSION_NAME,
+    version_code=VERSION_CODE,
+):
     """The manifest, the launcher icon, the themes and `assets`, compiled and linked into
     `out/base.apk`; `variant` is None (the release's app) or a key of VARIANTS."""
     manifest = (HERE / "AndroidManifest.xml").read_text(encoding="utf-8")
@@ -252,7 +261,7 @@ def link_resources(aapt2, android_jar, out, assets, variant, abi=ABI):
         "--java", out / "generated", "--custom-package", "io.github.juanluci.starling",
         "-I", android_jar,
         "--min-sdk-version", MIN_SDK, "--target-sdk-version", TARGET_SDK,
-        "--version-code", VERSION_CODE, "--version-name", VERSION_NAME,
+        "--version-code", version_code, "--version-name", version_name,
         *debug,
         "-A", assets,
         *sorted(compiled.glob("*.flat")),
@@ -319,6 +328,18 @@ def main():
         help=f"Starling Preview ({APPLICATION_ID}{VARIANTS['preview'][0]}), the organisation's CI build",
     )
     parser.add_argument("--abi", choices=TARGETS, default=ABI, help="Android ABI (default: arm64-v8a)")
+    parser.add_argument(
+        "--version-name", default=VERSION_NAME,
+        help=f"Android versionName (default: {VERSION_NAME})",
+    )
+    parser.add_argument(
+        "--version-code", type=int, default=VERSION_CODE,
+        help=f"Android versionCode (default: {VERSION_CODE})",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=None,
+        help="Optional output path for the signed APK (default: target/android/starling-...apk)",
+    )
     args = parser.parse_args()
     triple, _, _ = TARGETS[args.abi]
 
@@ -348,14 +369,24 @@ def main():
         return
 
     variant = "dev" if args.dev else "preview" if args.preview else None
-    link_resources(tool(build_tools, "aapt2"), android_jar, out, assets(out), variant, args.abi)
+    link_resources(
+        tool(build_tools, "aapt2"),
+        android_jar,
+        out,
+        assets(out),
+        variant,
+        args.abi,
+        version_name=args.version_name,
+        version_code=args.version_code,
+    )
     dex = compile_java(build_tools, android_jar, out)
     libraries = build_launchers(ndk, out, args.abi)
     libraries[library.name] = library
     add_code(out / "base.apk", libraries, dex, out / "unsigned.apk", args.abi)
     aligned = out / "aligned.apk"
     run(tool(build_tools, "zipalign"), "-P", "16", "-f", "4", out / "unsigned.apk", aligned)
-    apk = out / f"starling{'-' + variant if variant else ''}-{VERSION_NAME}-{args.abi}.apk"
+    apk = args.output or (out / f"starling{'-' + variant if variant else ''}-{args.version_name}-{args.abi}.apk")
+    apk.parent.mkdir(parents=True, exist_ok=True)
     sign(build_tools, aligned, apk, out)
     print(apk)
     if args.zip:

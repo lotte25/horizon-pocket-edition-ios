@@ -27,11 +27,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Where the app was built from: the repository and branch whose `ios` workflow builds it again.
 const REPO: &str = match option_env!("HORIZON_IOS_REPO") {
     Some(repo) => repo,
-    None => "shopifygav222/horizon-pocket-edition-ios",
+    None => "lotte25/horizon-pocket-edition-ios",
 };
 const BRANCH: &str = match option_env!("HORIZON_IOS_BRANCH") {
     Some(branch) => branch,
-    None => "main",
+    None => "classic-pe",
 };
 const WORKFLOW: &str = "ios.yml";
 /// GitHub's form for a fine-grained token, filled in: its name, a year, and Actions: Read and

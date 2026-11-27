@@ -1,0 +1,219 @@
+name: ios-release
+run-name: iOS Release · ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || github.sha }}
+# Official iOS release build: compiles horizon-ios-game with the 14 default native mods,
+# stamps the x.x.x release version into CFBundleShortVersionString, packages Starling.ipa,
+# verifies no Mojang files are bundled, and publishes it to the matching GitHub Release.
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+      - '!*-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version in x.x.x format (e.g. 1.0.0)"
+        type: string
+        required: true
+      mods:
+        description: "Native mods to build in (ids, spaces or commas; empty = no native mods)"
+        type: string
+        default: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud worldmap zoom"
+      publish:
+        description: "Create/update the GitHub Release for this version and attach Starling.ipa"
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: ios-release-${{ github.ref_type == 'tag' && github.ref_name || inputs.version || github.sha }}
+  cancel-in-progress: false
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  # Release with fewer codegen passes: the release profile's single unit and LTO cost minutes.
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+  # The app's own minimum (project.yml); rustc and cc read it.
+  IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+  # Where the app was built from (game/native_builds_ios.rs): keeps official_build() true.
+  HORIZON_IOS_REPO: ${{ github.repository }}
+  HORIZON_IOS_BRANCH: ${{ github.ref_type == 'branch' && github.ref_name || 'classic-pe' }}
+  DEFAULT_MODS: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud worldmap zoom"
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      IOS_TARGET: aarch64-apple-ios
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve release version and native mods
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_MODS: ${{ inputs.mods }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+            mods="$INPUT_MODS"
+          else
+            version="$REF_NAME"
+            mods="$DEFAULT_MODS"
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release version '$version' must match x.x.x (e.g. 1.0.0)"
+            exit 1
+          fi
+          trimmed="$(printf '%s' "$mods" | tr ',' ' ' | xargs || true)"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_MODS=$trimmed" >> "$GITHUB_ENV"
+          if [ -n "$trimmed" ]; then
+            echo "HAS_MODS=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_MODS=false" >> "$GITHUB_ENV"
+          fi
+          echo "::notice::Building iOS release Starling $version"
+      - name: Fetch and check the native mods
+        if: ${{ env.HAS_MODS == 'true' }}
+        run: |
+          set -euo pipefail -f
+          # Built-in native mods live locally under native-mods/; no external registry fetch needed.
+          printf '{"projects":[]}\n' > "$RUNNER_TEMP/index.json"
+          python3 tools/ios_native_mods.py fetch "$RUNNER_TEMP/index.json" "$RUNNER_TEMP/native" ${RELEASE_MODS}
+          python3 tools/ios_native_mods.py info "$RUNNER_TEMP/native" "$GITHUB_SHA" > "$RUNNER_TEMP/native-mods.json"
+      - name: Check the Apple toolchain
+        run: bash tools/ci/ios-toolchain.sh
+      - name: Install Rust and its iOS standard library
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target "$IOS_TARGET"
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ios-${{ env.IOS_TARGET }}
+          cache-on-failure: true
+          # Reuse the plain build cache without overwriting it when native mods are staged.
+          save-if: ${{ env.HAS_MODS != 'true' }}
+      - uses: actions/cache@v4
+        if: ${{ env.HAS_MODS == 'true' }}
+        with:
+          path: ~/.cache/starling-native
+          key: native-mixins-${{ runner.os }}-${{ hashFiles('packaging/android/native_build.sh') }}
+      - name: Apply the native mods to the source
+        if: ${{ env.HAS_MODS == 'true' }}
+        run: |
+          bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles" 2>&1 | tee native-stage.log
+          echo "::notice::built with $(python3 tools/ios_native_mods.py names "$RUNNER_TEMP/native")"
+      - name: Build the game
+        env:
+          # A build for others: no developer launch arguments (main.rs PUBLIC_BUILD).
+          HORIZON_IOS_PUBLIC: "1"
+          # The Microsoft sign-in app (shared/account.rs): a repository variable, else the built-in one.
+          HORIZON_MSA_CLIENT_ID: ${{ vars.HORIZON_MSA_CLIENT_ID }}
+        run: |
+          export HORIZON_IOS_BUILD_COMMIT="$GITHUB_SHA"
+          cargo build --release --target "$IOS_TARGET" -p horizon-ios-game
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: actions/cache@v4
+        with:
+          path: .local/ios-cache/minecraft
+          key: ios-minecraft-${{ hashFiles('research-lock.json') }}
+      - name: Prepare the game files and prove the phone lays them out the same
+        run: |
+          set -euo pipefail
+          # A phone's file system is case-sensitive; this Mac's is not.
+          hdiutil create -size 16g -fs 'Case-sensitive APFS' -volname StarlingPrep -type SPARSE \
+            "$RUNNER_TEMP/prep.sparseimage" > /dev/null
+          hdiutil attach "$RUNNER_TEMP/prep.sparseimage" > /dev/null
+          python3 tools/ios_prepare.py --java-home "$JAVA_HOME" \
+            --minecraft .local/ios-cache/minecraft --work /Volumes/StarlingPrep/work
+      - name: Bundle Starling.ipa
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null || brew install xcodegen
+          ( cd packaging/ios && xcodegen generate )
+          HORIZON_GAME_PREBUILT=1 xcodebuild -project packaging/ios/HorizonPE.xcodeproj \
+            -target HorizonPE -configuration Release -sdk iphoneos -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            MARKETING_VERSION="$RELEASE_VERSION" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CONFIGURATION_BUILD_DIR="$PWD/build-ios" \
+            build > xcode-build.log 2>&1 || { tail -80 xcode-build.log; exit 1; }
+          app=build-ios/HorizonPE.app
+          shown=$(plutil -extract CFBundleShortVersionString raw "$app/Info.plist")
+          id=$(plutil -extract CFBundleIdentifier raw "$app/Info.plist")
+          test "$shown" = "$RELEASE_VERSION" || {
+            echo "::error::expected CFBundleShortVersionString=$RELEASE_VERSION, got $shown"
+            exit 1
+          }
+          echo "::notice::Starling $shown (build $GITHUB_RUN_NUMBER), $id"
+          for asset in engine-data.zip lowbudget.zip StarlingVisuals.zip; do
+            test -f "$app/assets/$asset" || { echo "::error::the app has no assets/$asset"; exit 1; }
+          done
+          cmp -s "$app/HorizonPE" "target/$IOS_TARGET/release/horizon-ios-game" \
+            || { echo '::error::the app does not contain the Rust game'; exit 1; }
+          if [ -f "$RUNNER_TEMP/native-mods.json" ]; then
+            cp "$RUNNER_TEMP/native-mods.json" "$app/native-mods.json"
+          fi
+          rm -rf game && mkdir -p game/Payload
+          cp -a "$app" game/Payload/
+          ( cd game && zip -qry ../Starling.ipa Payload )
+          ls -l Starling.ipa
+      - name: Say what the native mods did
+        if: ${{ failure() && env.HAS_MODS == 'true' }}
+        run: |
+          echo '::error::the build with native mods failed. A mod made for another game version may not apply (native-stage.log) or compile (the build step names its file).'
+          tail -40 native-stage.log 2>/dev/null || true
+      - name: Preserve the Xcode log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-xcode-log
+          path: xcode-build.log
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Check Starling.ipa carries no Mojang files
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('Starling.ipa') as ipa:
+              names = ipa.namelist()
+          bad = [n for n in names if n.endswith(('.jar', '.ogg')) or '/minecraft/' in n or n.endswith('asset-index.json')]
+          if bad:
+              raise SystemExit(f'::error::the .ipa carries game files: {bad[:5]}')
+          print(f'{len(names)} entries, none of them Mojang files')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Starling-ios-${{ env.RELEASE_VERSION }}
+          path: Starling.ipa
+          retention-days: 30
+          if-no-files-found: error
+      - name: Publish Starling.ipa to GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_VERSION"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            # Create the release; ignore race if android-release created it at the same time.
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --generate-notes || gh release view "$tag" >/dev/null 2>&1
+          fi
+          gh release upload "$tag" Starling.ipa --clobber

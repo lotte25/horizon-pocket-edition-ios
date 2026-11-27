@@ -1,19 +1,16 @@
-//! Android: the prompt, over the title screen, when GitHub has a newer Starling release than this
-//! one: the newest of the organisation's repository and Starling's own (starling_releases, which
-//! also keeps Horizon Android's releases and preview builds out). Update downloads its APK and
-//! hands it to Android's installer, which asks the player (and, the first time, to allow
-//! installing from Starling) and offers to open the game again once it is in; Tomorrow asks again
-//! in a day; No, at the next start. Only a release asks: a test build is signed with another key,
-//! and the release could not install over it (`STARLING_UPDATE_TEST=<version>` makes one ask as
-//! that version, to try the prompt).
+//! Android: the prompt, over the title screen, when GitHub has a newer official release (`x.x.x`)
+//! in `lotte25/horizon-pocket-edition-ios` (`starling_releases`) with `Starling.apk`. Update
+//! downloads `Starling.apk` and hands it to Android's installer, which asks the player (and, the
+//! first time, to allow installing from Starling) and offers to open the game again once it is in;
+//! Tomorrow asks again in a day; No, at the next start. Only a release asks: a test build is
+//! signed with another key, and the release could not install over it
+//! (`STARLING_UPDATE_TEST=<version>` makes one ask as that version, to try the prompt).
 //!
-//! iOS: the same prompt for Horizon PE, from this port's own repository
-//! (horizon_client::ios_releases), and only ever for the edition this app is: Horizon PE is
-//! offered Horizon PE's releases, Horizon PE: Shared Worlds its own. Update downloads the
-//! release's .ipa and opens the share sheet on it, where the player picks their sideloading app
-//! (or Save to Files): iOS lets no app install another by itself. An app built in a player's
-//! own fork, or with native mods, is told of the release and how it is updated there instead:
-//! the release's .ipa has no native mods and builds none for that fork.
+//! iOS: the same prompt from `lotte25/horizon-pocket-edition-ios` (`horizon_client::ios_releases`)
+//! for official `x.x.x` releases with `Starling.ipa`. Update downloads `Starling.ipa` and opens
+//! the share sheet on it, where the player picks their sideloading app (or Save to Files): iOS
+//! lets no app install another by itself. An app built in another fork is told of the release and
+//! how to update there instead.
 use super::Game;
 #[cfg(target_os = "ios")]
 use horizon_client::ios_releases;
@@ -87,7 +84,7 @@ fn now() -> u64 {
 #[cfg(target_os = "android")]
 const NAME: &str = "Starling";
 #[cfg(target_os = "ios")]
-const NAME: &str = ios_releases::EDITION.name();
+const NAME: &str = ios_releases::APP_NAME;
 
 /// This app's version, and whether a release installs over it.
 #[cfg(target_os = "android")]
@@ -138,27 +135,23 @@ fn latest(url: &str, current: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
-/// iOS: the newest release of this app's edition, when it is newer than `current` and has its
-/// .ipa.
+/// iOS: the newest official release (`x.x.x`), when it is newer than `current` and has
+/// `Starling.ipa`.
 #[cfg(target_os = "ios")]
 fn check(current: &str) -> Result<Option<Release>, String> {
     let releases = latest(&ios_releases::releases_url(), current)?;
-    Ok(ios_releases::update_in(
-        &releases,
-        ios_releases::EDITION,
-        current,
-    ))
+    Ok(ios_releases::update_in(&releases, current))
 }
 
-/// The newest Starling release on GitHub, when it is newer than `current` and has its APK: every
-/// repository asked, an error only when none answered.
+/// Android: the newest official release (`x.x.x`) on GitHub, when it is newer than `current` and
+/// has `Starling.apk`: every repository asked, an error only when none answered.
 #[cfg(target_os = "android")]
 fn check(current: &str) -> Result<Option<Release>, String> {
     let mut found = Vec::new();
     let mut errors = Vec::new();
     for repository in releases::REPOSITORIES {
-        match latest(&releases::latest_url(repository), current) {
-            Ok(release) => found.extend(releases::update_in(&release, current)),
+        match latest(&releases::releases_url(repository), current) {
+            Ok(list) => found.extend(releases::update_in(&list, current)),
             Err(e) => errors.push(format!("{repository}: {e}")),
         }
     }

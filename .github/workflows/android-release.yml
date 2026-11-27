@@ -1,0 +1,183 @@
+name: android-release
+run-name: Android Release · ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || github.sha }}
+# Official Android release build: compiles horizon-android with the 14 default native mods,
+# stamps the x.x.x release version, signs with ANDROID_KEYSTORE, outputs Starling.apk, and
+# publishes it to the matching GitHub Release.
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+      - '!*-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version in x.x.x format (e.g. 1.0.0)"
+        type: string
+        required: true
+      mods:
+        description: "Native mods to build in (ids, spaces or commas; empty = no native mods)"
+        type: string
+        default: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud worldmap zoom"
+      profile:
+        description: "Cargo profile (fast = Starling release default; release = full thin-LTO)"
+        type: choice
+        default: fast
+        options:
+          - fast
+          - release
+      publish:
+        description: "Create/update the GitHub Release for this version and attach Starling.apk"
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: android-release-${{ github.ref_type == 'tag' && github.ref_name || inputs.version || github.sha }}
+  cancel-in-progress: false
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  ANDROID_TARGET: aarch64-linux-android
+  ANDROID_ABI: arm64-v8a
+  # Pinned in packaging/android/build_apk.py.
+  ANDROID_API: "26"
+  ANDROID_COMPILE_SDK: "36"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+  DEFAULT_MODS: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud worldmap zoom"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve release version and native mods
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_MODS: ${{ inputs.mods }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+            mods="$INPUT_MODS"
+          else
+            version="$REF_NAME"
+            mods="$DEFAULT_MODS"
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release version '$version' must match x.x.x (e.g. 1.0.0)"
+            exit 1
+          fi
+          IFS='.' read -r major minor patch <<< "$version"
+          version_code=$((10#$major * 1000000 + 10#$minor * 1000 + 10#$patch + 100))
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+          echo "RELEASE_MODS=$mods" >> "$GITHUB_ENV"
+          echo "::notice::Building Android release Starling $version (versionCode $version_code)"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ env.ANDROID_TARGET }}
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: android-${{ env.ANDROID_TARGET }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/starling-native
+          key: android-tools-${{ runner.os }}-${{ hashFiles('packaging/android/native_build.sh') }}-v1
+      - name: Install Android SDK/NDK, cmake, and cargo-ndk
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
+          sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          sdkmanager="$(find "$sdk/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          test -x "$sdkmanager"
+          (yes || true) | "$sdkmanager" --sdk_root="$sdk" \
+            "platforms;android-$ANDROID_COMPILE_SDK" \
+            "build-tools;$ANDROID_BUILD_TOOLS" \
+            "ndk;$ANDROID_NDK_VERSION" > /dev/null
+          ndk="$sdk/ndk/$ANDROID_NDK_VERSION"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          tools="$HOME/.cache/starling-native/cargo-ndk"
+          if [ ! -x "$tools/bin/cargo-ndk" ]; then
+            cargo install --locked cargo-ndk --root "$tools"
+          fi
+          echo "$tools/bin" >> "$GITHUB_PATH"
+      - name: Stage native mods
+        run: |
+          set -euo pipefail
+          read -ra ids <<< "$(printf '%s' "$RELEASE_MODS" | tr ',' ' ')" || true
+          if [ "${#ids[@]}" -eq 0 ]; then
+            echo "No native mods requested; building plain Android release APK."
+            exit 0
+          fi
+          # Built-in native mods live locally under native-mods/; no external registry fetch needed.
+          printf '{"projects":[]}\n' > "$RUNNER_TEMP/index.json"
+          python3 tools/ios_native_mods.py fetch "$RUNNER_TEMP/index.json" "$RUNNER_TEMP/native" "${ids[@]}"
+          bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles"
+      - name: Build, pack, and sign Starling.apk
+        env:
+          PROFILE: ${{ inputs.profile || 'fast' }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/key.jks"
+            export HORIZON_ANDROID_KEYSTORE="$RUNNER_TEMP/key.jks"
+            export HORIZON_ANDROID_KEY_ALIAS="horizon"
+            export HORIZON_ANDROID_STORE_PASSWORD="$KEYSTORE_PASSWORD"
+            export HORIZON_ANDROID_KEY_PASSWORD="$KEYSTORE_PASSWORD"
+          else
+            echo "::warning::no ANDROID_KEYSTORE secret: signed with a throwaway debug key, so auto-updates will not install over this APK"
+          fi
+          python3 packaging/android/build_apk.py \
+            --abi "$ANDROID_ABI" \
+            --profile "$PROFILE" \
+            --version-name "$RELEASE_VERSION" \
+            --version-code "$RELEASE_VERSION_CODE" \
+            --output Starling.apk
+          test -f Starling.apk
+          # The library must really export the entry points NativeActivity and StarlingActivity call.
+          so="target/android/libhorizon_android.so"
+          nm="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          "$nm" -D --defined-only "$so" | grep -q ' starling_on_create$'
+          "$nm" -D --defined-only "$so" | grep -q ' ANativeActivity_onCreate$'
+          unzip -l Starling.apk
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Starling-android-${{ env.RELEASE_VERSION }}
+          path: Starling.apk
+          retention-days: 30
+          if-no-files-found: error
+      - name: Publish Starling.apk to GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_VERSION"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            # Create the release; ignore race if ios-release created it at the same time.
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --generate-notes || gh release view "$tag" >/dev/null 2>&1
+          fi
+          gh release upload "$tag" Starling.apk --clobber

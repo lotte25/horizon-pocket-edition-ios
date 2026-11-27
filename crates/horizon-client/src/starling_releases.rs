@@ -1,19 +1,25 @@
-//! Where Starling's releases come out, and what of a release is Starling's: for the update prompt
-//! (game/update_offer.rs) and the native mod builds (game/native_builds.rs), on Android.
+//! Where Starling's official releases come out, and what of a release is an update: for the
+//! update prompt (game/update_offer.rs) and the native mod builds (game/native_builds.rs), on
+//! Android.
 //!
-//! Starling and Horizon Android are one project now, in the organisation's repository
-//! (starling-client/starling); Starling's own (JuanLuci/starling) is where its releases came out
-//! before, and still do until the merged one. Both are asked, the organisation's first, so an
-//! install follows the releases wherever they come out. The organisation's repository also holds
-//! Horizon Android's releases (its APKs are named after it) and preview builds of Starling
-//! (`starling-preview-...`): only an APK named `starling-<version>-...` is an update.
+//! Official releases come only from this repository (`lotte25/horizon-pocket-edition-ios`) with
+//! tags in `x.x.x` format (e.g. `1.0.0`) and an Android asset named `Starling.apk`. Upstream
+//! Starling repositories are disabled so players only ever receive releases from this repository.
 
-/// The repositories, as GitHub's API names them, the organisation's first.
-pub const REPOSITORIES: [&str; 2] = ["starling-client/starling", "JuanLuci/starling"];
+/// The repositories, as GitHub's API names them.
+pub const REPOSITORIES: [&str; 1] = ["lotte25/horizon-pocket-edition-ios"];
+
+/// The Android release asset file name.
+pub const ANDROID_ASSET: &str = "Starling.apk";
 
 /// A repository's latest release, as GitHub's API serves it.
 pub fn latest_url(repository: &str) -> String {
     format!("https://api.github.com/repos/{repository}/releases/latest")
+}
+
+/// A repository's releases, newest first, as GitHub's API serves them.
+pub fn releases_url(repository: &str) -> String {
+    format!("https://api.github.com/repos/{repository}/releases?per_page=50")
 }
 
 /// A repository's release of native mod builds (native-mods.yml publishes to it).
@@ -21,7 +27,19 @@ pub fn native_builds_url(repository: &str) -> String {
     format!("https://api.github.com/repos/{repository}/releases/tags/native-builds")
 }
 
-/// Whether version `latest` (a tag: `v0.1.2`) comes after `current` (`0.1.1`), number by number.
+/// The version of an official release tag (`x.x.x`, e.g. `1.0.0`): three dot-separated non-empty
+/// decimal numbers and nothing else.
+pub fn release_version(tag: &str) -> Option<&str> {
+    let mut parts = tag.split('.');
+    let valid = |n: &str| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit());
+    let ok = parts.next().is_some_and(valid)
+        && parts.next().is_some_and(valid)
+        && parts.next().is_some_and(valid)
+        && parts.next().is_none();
+    ok.then_some(tag)
+}
+
+/// Whether version `latest` (`1.0.1` or `v1.0.1`) comes after `current` (`1.0.0`), number by number.
 pub fn newer(latest: &str, current: &str) -> bool {
     let numbers = |v: &str| -> Vec<u64> {
         v.trim_start_matches('v')
@@ -32,12 +50,12 @@ pub fn newer(latest: &str, current: &str) -> bool {
     numbers(latest) > numbers(current)
 }
 
-/// A Starling release's APK.
+/// A Starling release's package (`Starling.apk` on Android, `Starling.ipa` on iOS).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Update {
-    /// Without its `v`: `0.8.0`.
+    /// Release version in `x.x.x` format (e.g. `1.0.0`).
     pub version: String,
-    /// The APK's file name, its download and its size.
+    /// The package's file name, its download URL and its size.
     pub name: String,
     pub url: String,
     pub size: u64,
@@ -67,22 +85,29 @@ pub fn native_build_matches(about: &serde_json::Value, abi: &str) -> bool {
     }
 }
 
-/// The release `latest` as an update when it has a newer APK for this process.
-pub fn update_in(latest: &serde_json::Value, current: &str) -> Option<Update> {
-    update_for_abi(latest, current, process_abi())
+/// The newest official release in `value` (either a single release object or the API's list of
+/// releases) that comes after `current` and carries `Starling.apk`. Drafts and pre-releases are
+/// never updates.
+pub fn update_in(value: &serde_json::Value, current: &str) -> Option<Update> {
+    if let Some(list) = value.as_array() {
+        newest(list.iter().filter_map(|r| update_in_release(r, current)))
+    } else {
+        update_in_release(value, current)
+    }
 }
 
-fn update_for_abi(latest: &serde_json::Value, current: &str, abi: &str) -> Option<Update> {
-    let tag = latest["tag_name"].as_str()?;
-    if !newer(tag, current) {
+fn update_in_release(release: &serde_json::Value, current: &str) -> Option<Update> {
+    if release["draft"].as_bool() == Some(true) || release["prerelease"].as_bool() == Some(true) {
         return None;
     }
-    let version = tag.trim_start_matches('v');
-    let name = format!("starling-{version}-{abi}.apk");
-    let apk = latest["assets"]
+    let version = release_version(release["tag_name"].as_str()?)?;
+    if !newer(version, current) {
+        return None;
+    }
+    let apk = release["assets"]
         .as_array()?
         .iter()
-        .find(|a| a["name"].as_str() == Some(name.as_str()))?;
+        .find(|a| a["name"].as_str() == Some(ANDROID_ASSET))?;
     Some(Update {
         version: version.to_owned(),
         name: apk["name"].as_str()?.to_owned(),
@@ -232,33 +257,95 @@ mod tests {
     }
 
     #[test]
-    fn updates_select_the_process_abi_even_when_another_apk_is_listed_first() {
-        let all = json!({"tag_name":"v0.3.0", "assets":[
-            asset("starling-0.3.0-arm64-v8a.apk"), asset("starling-0.3.0-armeabi-v7a.apk"),
-            asset("starling-0.3.0-x86.apk"), asset("starling-0.3.0-x86_64.apk")
-        ]});
-        for abi in ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] {
-            assert_eq!(
-                update_for_abi(&all, "0.2.3", abi).unwrap().name,
-                format!("starling-0.3.0-{abi}.apk")
-            );
+    fn repository_points_only_to_official_fork() {
+        assert_eq!(REPOSITORIES, ["lotte25/horizon-pocket-edition-ios"]);
+        assert_eq!(ANDROID_ASSET, "Starling.apk");
+    }
+
+    #[test]
+    fn release_version_requires_x_x_x_format() {
+        assert_eq!(release_version("1.0.0"), Some("1.0.0"));
+        assert_eq!(release_version("0.8.1"), Some("0.8.1"));
+        assert_eq!(release_version("12.34.56"), Some("12.34.56"));
+        for odd in [
+            "v1.0.0",
+            "1.0",
+            "1.0.0.0",
+            "1..0",
+            "1.0.0-beta",
+            "v0.8.0",
+            "native-builds",
+            "1.0.x",
+            "",
+        ] {
+            assert_eq!(release_version(odd), None, "{odd}");
         }
-        let release = json!({"tag_name":"v0.3.0", "assets":[
-            asset("starling-0.3.0-arm64-v8a.apk"), asset("starling-0.3.0-armeabi-v7a.apk")
-        ]});
-        assert_eq!(
-            update_for_abi(&release, "0.2.3", "armeabi-v7a")
-                .unwrap()
-                .name,
-            "starling-0.3.0-armeabi-v7a.apk"
-        );
-        assert_eq!(
-            update_for_abi(&release, "0.2.3", "arm64-v8a").unwrap().name,
-            "starling-0.3.0-arm64-v8a.apk"
-        );
-        let arm64_only =
-            json!({"tag_name":"v0.3.0", "assets":[asset("starling-0.3.0-arm64-v8a.apk")]});
-        assert!(update_for_abi(&arm64_only, "0.2.3", "armeabi-v7a").is_none());
+    }
+
+    #[test]
+    fn updates_match_x_x_x_tag_and_starling_apk_in_release_lists_and_objects() {
+        let release = json!({
+            "tag_name": "1.0.0",
+            "draft": false,
+            "prerelease": false,
+            "assets": [
+                asset("Starling.ipa"),
+                asset("Starling.apk"),
+            ]
+        });
+        let update = update_in(&release, "0.8.0").unwrap();
+        assert_eq!(update.version, "1.0.0");
+        assert_eq!(update.name, "Starling.apk");
+        assert_eq!(update.sha256.as_deref(), Some("ab"));
+        assert_eq!(update_in(&release, "1.0.0"), None, "not newer");
+
+        let list = json!([
+            {
+                "tag_name": "2.0.0",
+                "draft": true,
+                "prerelease": false,
+                "assets": [asset("Starling.apk")]
+            },
+            {
+                "tag_name": "1.9.0",
+                "draft": false,
+                "prerelease": true,
+                "assets": [asset("Starling.apk")]
+            },
+            {
+                "tag_name": "v1.5.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [asset("Starling.apk")]
+            },
+            {
+                "tag_name": "1.3.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [asset("Starling.ipa")]
+            },
+            {
+                "tag_name": "1.2.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [asset("starling-1.2.0-arm64-v8a.apk")]
+            },
+            {
+                "tag_name": "1.1.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [asset("Starling.apk")]
+            },
+            {
+                "tag_name": "1.10.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [asset("Starling.apk")]
+            },
+        ]);
+        let best = update_in(&list, "1.0.0").unwrap();
+        assert_eq!(best.version, "1.10.0");
+        assert_eq!(best.name, "Starling.apk");
     }
 
     #[test]
@@ -321,27 +408,25 @@ mod tests {
 
     #[test]
     fn only_starlings_own_apk_is_an_update() {
-        // Horizon Android's last release, the organisation's latest today: not Starling's.
         let horizon =
-            json!({"tag_name": "v0.7.8", "assets": [asset("Horizon-Android-0.7.8-arm64-v8a.apk")]});
-        assert_eq!(update_for_abi(&horizon, "0.2.2", "arm64-v8a"), None);
-        // A preview build is another app, signed with another key.
-        let preview = json!({"tag_name": "v0.8.0", "assets": [asset("starling-preview-0.8.0-arm64-v8a.apk")]});
-        assert_eq!(update_for_abi(&preview, "0.2.2", "arm64-v8a"), None);
-        let release = json!({"tag_name": "v0.8.0", "assets": [
-            asset("starling-preview-0.8.0-arm64-v8a.apk"),
+            json!({"tag_name": "0.7.8", "assets": [asset("Horizon-Android-0.7.8-arm64-v8a.apk")]});
+        assert_eq!(update_in(&horizon, "0.2.2"), None);
+        let preview =
+            json!({"tag_name": "0.8.0", "assets": [asset("starling-preview-0.8.0-arm64-v8a.apk")]});
+        assert_eq!(update_in(&preview, "0.2.2"), None);
+        let upstream =
+            json!({"tag_name": "v0.8.0", "assets": [asset("starling-0.8.0-arm64-v8a.apk")]});
+        assert_eq!(update_in(&upstream, "0.2.2"), None);
+        let release = json!({"tag_name": "1.0.0", "assets": [
+            asset("Starling.ipa"),
             asset("StarlingVisuals.zip"),
-            asset("starling-0.8.0-arm64-v8a.apk"),
+            asset("Starling.apk"),
         ]});
-        let update = update_for_abi(&release, "0.2.2", "arm64-v8a").unwrap();
-        assert_eq!(update.version, "0.8.0");
-        assert_eq!(update.name, "starling-0.8.0-arm64-v8a.apk");
+        let update = update_in(&release, "0.8.0").unwrap();
+        assert_eq!(update.version, "1.0.0");
+        assert_eq!(update.name, "Starling.apk");
         assert_eq!(update.sha256.as_deref(), Some("ab"));
-        assert_eq!(
-            update_for_abi(&release, "0.8.0", "arm64-v8a"),
-            None,
-            "not newer"
-        );
+        assert_eq!(update_in(&release, "1.0.0"), None, "not newer");
     }
 
     #[test]
