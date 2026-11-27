@@ -487,14 +487,14 @@ impl Game<'_> {
             self.release_remote_use();
         }
         if let Some(held_use) = tap {
-            if self.pick_entity_hit().is_some()
-                && self.using.is_none()
-                && self.screen == Screen::Playing
-            {
+            self.pick_tick_targets();
+            let hit_entity = self.pick_entity_hit().is_some();
+            if hit_entity && self.using.is_none() && self.screen == Screen::Playing {
                 self.remote_start_attack();
             } else if !held_use && !rocket_boost {
                 state.triggers[0] = 1.;
             }
+            self.release_tick_targets();
         }
         self.pad.set_touch_state(state);
         if chat {
@@ -899,14 +899,14 @@ impl Game<'_> {
                         self.release_remote_use();
                     }
                 }
-                if self.pick_entity_hit().is_some()
-                    && self.using.is_none()
-                    && self.screen == Screen::Playing
-                {
+                self.pick_tick_targets();
+                let hit_entity = self.pick_entity_hit().is_some();
+                if hit_entity && self.using.is_none() && self.screen == Screen::Playing {
                     self.remote_start_attack();
                 } else {
                     self.mobile.classic_pe.queue_use_tap();
                 }
+                self.release_tick_targets();
             }
             return;
         }
@@ -2310,6 +2310,7 @@ impl Game<'_> {
         let Some(b) = self.gui_scale() else {
             return;
         };
+        let prev_cursor = self.cursor;
         let position = self.mobile.ui.relative_touch(
             t.id,
             [t.location.x as f32 / b.scale, t.location.y as f32 / b.scale],
@@ -2320,18 +2321,23 @@ impl Game<'_> {
             !self.mobile.ui.mouse_held(),
         );
         self.cursor = (position[0], position[1]);
-        self.handle_window_event(
-            events,
-            id,
-            WindowEvent::CursorMoved {
-                device_id: t.device_id,
-                position: winit::dpi::PhysicalPosition::new(
-                    f64::from(position[0] * b.scale),
-                    f64::from(position[1] * b.scale),
-                ),
-            },
-            InputOrigin::User,
-        );
+        if (position[0] - prev_cursor.0).abs() > 0.01
+            || (position[1] - prev_cursor.1).abs() > 0.01
+            || t.phase == TouchPhase::Started
+        {
+            self.handle_window_event(
+                events,
+                id,
+                WindowEvent::CursorMoved {
+                    device_id: t.device_id,
+                    position: winit::dpi::PhysicalPosition::new(
+                        f64::from(position[0] * b.scale),
+                        f64::from(position[1] * b.scale),
+                    ),
+                },
+                InputOrigin::User,
+            );
+        }
         if matches!(
             t.phase,
             TouchPhase::Moved | TouchPhase::Ended | TouchPhase::Cancelled
@@ -2366,6 +2372,9 @@ impl Game<'_> {
             );
         }
         if button == MouseButton::Left && !down {
+            // Ensure drag/button state cannot stay stuck if the press switched screens.
+            self.dragging = false;
+            self.physical_buttons.remove(&MouseButton::Left);
             self.touch_field_click();
             if self.on_text_field() == Some(true) {
                 self.android_show_keyboard();
@@ -2416,15 +2425,37 @@ impl Game<'_> {
                     self.android_virtual_mouse_button(events, button, false);
                 }
                 VirtualMouseEvent::Scroll(dy) => {
+                    let scroll_x = self.mobile.ui.virtual_mouse_scroll_x();
+                    let gui_size = self.gui_scale().map(|b| (b.width, b.height));
+                    let cursor = self.cursor;
                     if self.screen == Screen::Options {
-                        if let Some(b) = self.gui_scale() {
-                            self.ui.options.scroll_at(
-                                &self.settings,
-                                (b.width, b.height),
-                                self.cursor,
-                                dy,
-                            );
+                        if let Some((w, h)) = gui_size {
+                            // On Pack Selection, if a prior left click left the cursor on the
+                            // search box or top/bottom buttons, scroll the pack list under the
+                            // 2-finger gesture's side instead of dropping the scroll.
+                            let mut target = cursor;
+                            if self.ui.options.page() == horizon_client::options_ui::Page::Packs
+                                && (target.1 < 56.0 || target.1 > h - 44.0)
+                            {
+                                target =
+                                    (scroll_x.unwrap_or(cursor.0).clamp(16.0, w - 16.0), h * 0.5);
+                            }
+                            self.ui
+                                .options
+                                .scroll_at(&self.settings, (w, h), target, dy);
                         }
+                    } else if !self.dialog_open()
+                        && self.code_of_conduct.is_none()
+                        && self.screen != Screen::Win
+                        && let Some((w, h)) = gui_size
+                        && let Some(title) = &mut self.title
+                    {
+                        // After left-clicking top/bottom buttons (e.g. Singleplayer,
+                        // Multiplayer, Refresh, search box), the cursor sits outside the
+                        // list bounds; aim the 2-finger wheel into the list band so scrolling
+                        // always works immediately.
+                        let list_cursor = (cursor.0.clamp(w * 0.2, w * 0.8), h * 0.5);
+                        title.scroll_worlds(dy, list_cursor, (w, h));
                     } else if let Some(id) = self.window.as_ref().map(|w| w.id()) {
                         self.handle_window_event(
                             events,

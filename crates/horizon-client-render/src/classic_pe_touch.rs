@@ -1800,8 +1800,8 @@ impl ClassicPeState {
     }
 
     fn draw_touch_circle(&self, batch: &mut HudBatch, atlas: &HudAtlas) {
-        let radius = (batch.height * 0.082).clamp(18.0, 28.0);
-        let ring_w = 2.0;
+        let radius = (batch.height * 0.118).clamp(26.0, 42.0);
+        let ring_w = 2.5;
 
         // 1. Active hold / mining circle (follows the finger smoothly across adjacent blocks).
         if let Some(pos) = self.touches.active_mine_pos() {
