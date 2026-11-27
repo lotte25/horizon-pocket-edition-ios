@@ -773,7 +773,17 @@ impl<'a> Ui<'a> {
     pub fn new(atlas: &'a HudAtlas, batch: &'a mut HudBatch, cursor: (f32, f32)) -> Self {
         let scale = batch.scale;
         let (pw, ph) = (batch.width * scale, batch.height * scale);
-        let density = (pw / 1040.0).min(ph / 700.0).clamp(1.0, 4.0);
+        Self::with_density(atlas, batch, cursor, crate::ui_theme::density(pw, ph))
+    }
+    /// Same as [`Ui::new`], with an explicit pixel-per-dp `density`.
+    pub fn with_density(
+        atlas: &'a HudAtlas,
+        batch: &'a mut HudBatch,
+        cursor: (f32, f32),
+        density: f32,
+    ) -> Self {
+        let scale = batch.scale;
+        let (pw, ph) = (batch.width * scale, batch.height * scale);
         Self {
             atlas,
             w: pw / density,
@@ -795,34 +805,33 @@ impl<'a> Ui<'a> {
             / 100.0)
             .clamp(0.75, 1.65);
         let base_density = if ph > pw {
-            // Portrait phone screen: target ~410dp width so cards and touch buttons are comfortable.
-            let target_dpi = (pw / 410.0).min(ph / 640.0);
+            // Portrait phone screen: target ~340dp width so cards and touch buttons are comfortable.
+            let target_dpi = (pw / 340.0).min(ph / 540.0);
             if hw_dpi >= 1.0 {
-                (target_dpi * 0.7 + hw_dpi * 0.3).clamp(1.0, 4.5)
+                (target_dpi * 0.7 + hw_dpi * 0.3).clamp(1.0, 5.5)
             } else {
-                target_dpi.clamp(1.0, 4.5)
+                target_dpi.clamp(1.0, 5.5)
             }
         } else {
-            // Landscape phone/tablet screen: target ~440dp height (and ~880dp width) so the
-            // left navigation rail, header, and 2-column cards match phone DPI with breathing room.
-            let fit_phone = (pw / 880.0).min(ph / 440.0);
+            // Landscape phone/tablet screen: target ~340dp height (and ~680dp width) so the
+            // floating control hub, cards, sliders, and text are comfortably sized on smartphones.
+            let fit_phone = (pw / 680.0).min(ph / 340.0);
             let dpi = if hw_dpi >= 1.0 {
-                (hw_dpi * 0.78).min(ph / 435.0).max(fit_phone)
+                (hw_dpi * 0.98).min(ph / 335.0).max(fit_phone)
             } else {
                 fit_phone
             };
-            dpi.clamp(0.65, 4.5)
+            dpi.clamp(0.75, 5.5)
         };
-        // Ensure landscape viewports always have at least 410-440dp of vertical breathing room
-        // and 760-880dp of horizontal width even on high-density (3.0-3.5x) screens.
+        // Keep safe room for the sidebar, header, and cards even on high-density (3.0-4.0x) screens.
         let max_safe_density = if ph > pw {
-            (pw / 340.0).max(1.0)
+            (pw / 280.0).max(1.0)
         } else {
-            (ph / 410.0).min(pw / 760.0).max(1.0)
+            (ph / 315.0).min(pw / 600.0).max(1.0)
         };
         ui.density = (base_density * user_scale)
             .min(max_safe_density)
-            .clamp(0.5, 4.5);
+            .clamp(0.5, 5.5);
         ui.w = pw / ui.density;
         ui.h = ph / ui.density;
         ui.cursor = (

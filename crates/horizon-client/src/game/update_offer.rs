@@ -226,7 +226,7 @@ fn download(
 
 /// The UI's scale for a window of `w` x `h` pixels (as `Ui::new`).
 fn density(w: f32, h: f32) -> f32 {
-    (w / 1040.0).min(h / 700.0).clamp(1.0, 4.0)
+    horizon_client::ui_theme::density(w, h)
 }
 
 impl Game<'_> {

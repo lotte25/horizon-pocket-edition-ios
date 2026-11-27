@@ -420,7 +420,7 @@ fn download(build: &Build, version: &str, shared: &Mutex<Shared>) -> Result<Stri
 
 /// The UI's scale for a window of `w` x `h` pixels (as `Ui::new`).
 pub(super) fn density(w: f32, h: f32) -> f32 {
-    (w / 1040.0).min(h / 700.0).clamp(1.0, 4.0)
+    horizon_client::ui_theme::density(w, h)
 }
 
 /// What the build this game runs says of itself (its `build.json`: the mods in it).

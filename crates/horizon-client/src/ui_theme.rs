@@ -330,12 +330,42 @@ pub struct Ui<'a> {
     pub density: f32,
     scale: f32,
 }
+/// Desktop launcher density (`1040×700` logical window).
+pub fn desktop_density(pw: f32, ph: f32) -> f32 {
+    (pw / 1040.0).min(ph / 700.0).clamp(1.0, 4.0)
+}
+
+/// Physical pixels per dp for [`Ui`]. On smartphones (`PHONE`), targets a comfortable
+/// `~700×450` dp landscape (`~420×640` dp portrait) viewport so native Starling/Horizon overlays,
+/// cards, buttons, and text are comfortably readable and tappable on phone screens.
+pub fn density(pw: f32, ph: f32) -> f32 {
+    if crate::PHONE {
+        if ph > pw {
+            (pw / 420.0).min(ph / 640.0).clamp(1.0, 5.5)
+        } else {
+            (pw / 700.0).min(ph / 450.0).clamp(1.0, 5.5)
+        }
+    } else {
+        desktop_density(pw, ph)
+    }
+}
+
 impl<'a> Ui<'a> {
     /// `cursor` is in GUI pixels, like every screen's input.
     pub fn new(atlas: &'a HudAtlas, batch: &'a mut HudBatch, cursor: (f32, f32)) -> Self {
         let scale = batch.scale;
         let (pw, ph) = (batch.width * scale, batch.height * scale);
-        let density = (pw / 1040.0).min(ph / 700.0).clamp(1.0, 4.0);
+        Self::with_density(atlas, batch, cursor, density(pw, ph))
+    }
+    /// Same as [`Ui::new`], with an explicit pixel-per-dp `density`.
+    pub fn with_density(
+        atlas: &'a HudAtlas,
+        batch: &'a mut HudBatch,
+        cursor: (f32, f32),
+        density: f32,
+    ) -> Self {
+        let scale = batch.scale;
+        let (pw, ph) = (batch.width * scale, batch.height * scale);
         Self {
             atlas,
             w: pw / density,

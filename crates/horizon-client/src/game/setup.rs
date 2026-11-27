@@ -819,7 +819,7 @@ impl Loading {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
         let (pw, ph) = (size.width as f32, size.height as f32);
-        let density = (pw / 1040.0).min(ph / 700.0).clamp(1.0, 4.0);
+        let density = horizon_client::ui_theme::density(pw, ph);
         let p = [
             touch.location.x as f32 / density,
             touch.location.y as f32 / density,

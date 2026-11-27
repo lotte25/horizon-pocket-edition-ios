@@ -9,7 +9,7 @@
 //! listed too, and turns off instead.
 use super::Game;
 #[cfg(target_os = "android")]
-use super::native_builds::{density, wrapped};
+use super::native_builds::wrapped;
 use horizon_client::{
     hud::HudBatch,
     ui_theme::{Face, Ui, color},
@@ -25,10 +25,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use winit::event::{Touch, TouchPhase};
 
-/// iOS has no native builds (it runs no code built elsewhere): their card's scale, here.
-#[cfg(target_os = "ios")]
+/// The catalog already uses phone-sized constants calibrated to a 700-unit short side.
 fn density(w: f32, h: f32) -> f32 {
-    (w / 1040.0).min(h / 700.0).clamp(1.0, 4.0)
+    horizon_client::ui_theme::desktop_density(w, h)
 }
 
 /// iOS: `text` in lines of at most `width`, as the native builds' card wraps it.
@@ -1634,8 +1633,9 @@ impl Game<'_> {
         let shared = card.shared.lock().unwrap_or_else(PoisonError::into_inner);
         let mut drawn = Vec::new();
         let mut pictures = Vec::new();
+        let d = density(batch.width * batch.scale, batch.height * batch.scale);
         let (w, h, edge) = {
-            let mut ui = Ui::new(&self.gui.atlas, batch, (-1.0, -1.0));
+            let mut ui = Ui::with_density(&self.gui.atlas, batch, (-1.0, -1.0), d);
             let (w, h) = (ui.w, ui.h);
             let edge = w - MARGIN - if card.typing { w * NAV_BAR_SHARE } else { 0.0 };
             ui.fill(0.0, 0.0, w, h, color::BG);
@@ -1651,8 +1651,12 @@ impl Game<'_> {
         // same units and the same atlas space as this screen's.
         {
             let atlas = &self.gui.atlas;
-            let mut art =
-                horizon_client::android_control_theme::Ui::new(atlas, batch, (-1.0, -1.0));
+            let mut art = horizon_client::android_control_theme::Ui::with_density(
+                atlas,
+                batch,
+                (-1.0, -1.0),
+                d,
+            );
             art.set_clip(Some([0.0, HEAD_H, w, (h - HEAD_H - FOOT_H).max(0.0)]));
             for (key, [x, y, pw, ph]) in &pictures {
                 let Some(Picture::Ready(pixels)) = shared.pictures.get(key) else {
@@ -1675,7 +1679,7 @@ impl Game<'_> {
             }
             art.finish();
         }
-        let mut ui = Ui::new(&self.gui.atlas, batch, (-1.0, -1.0));
+        let mut ui = Ui::with_density(&self.gui.atlas, batch, (-1.0, -1.0), d);
         // The rows go under these two.
         ui.fill(0.0, 0.0, w, HEAD_H, color::BG);
         ui.fill(0.0, h - FOOT_H, w, FOOT_H, color::BG);
