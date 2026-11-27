@@ -2869,4 +2869,51 @@ mod tests {
         let parsed: ClassicPeConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, cfg);
     }
+
+    #[test]
+    fn multitouch_back_while_mining_hotbar_while_running_and_per_finger_cancel() {
+        let l = bedrock_layout(
+            640.0,
+            320.0,
+            &ClassicPeConfig::default(),
+            LayoutOptions::default(),
+        );
+        let mut t = ClassicPeTouches::default();
+
+        // 1. Hold finger 1 on world until mining starts, then press Back with finger 2.
+        let world_pt = (320.0, 140.0);
+        assert!(t.start(1, world_pt, 1.0, &l).is_empty());
+        assert_eq!(t.frame(1.40), vec![TouchOut::MineStart(world_pt)]);
+        let back = center(&l, ClassicPeControl::Back);
+        assert_eq!(
+            t.start(2, back, 1.45, &l),
+            vec![TouchOut::Press(ClassicPeControl::Back)]
+        );
+        assert_eq!(t.active_mine_pos(), Some(world_pt));
+        assert_eq!(t.dpad_mask(), DPAD_BACK);
+
+        // 2. A cancelled third touch must NOT wipe finger 1 (mining) or finger 2 (Back),
+        //    and must NOT emit a spurious world tap.
+        assert!(t.start(3, (400.0, 140.0), 1.50, &l).is_empty());
+        assert!(t.cancel(3).is_empty());
+        assert_eq!(t.active_mine_pos(), Some(world_pt));
+        assert_eq!(t.dpad_mask(), DPAD_BACK);
+
+        // 3. Running forward + tapping a hotbar slot selects the slot without dropping Forward.
+        let _ = t.end(1);
+        let _ = t.end(2);
+        let fwd = center(&l, ClassicPeControl::Forward);
+        assert_eq!(
+            t.start(4, fwd, 2.0, &l),
+            vec![TouchOut::Press(ClassicPeControl::Forward)]
+        );
+        let slot3 = center(&l, ClassicPeControl::Hotbar(3));
+        assert_eq!(
+            t.start(5, slot3, 2.1, &l),
+            vec![TouchOut::Press(ClassicPeControl::Hotbar(3))]
+        );
+        assert_eq!(t.dpad_mask(), DPAD_FORWARD);
+        let _ = t.end(5);
+        assert_eq!(t.dpad_mask(), DPAD_FORWARD);
+    }
 }

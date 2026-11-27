@@ -929,12 +929,17 @@ impl Game<'_> {
             .chain(self.offhand.as_ref())
             .any(|s| horizon_client::android_controls::projectile_crosshair(&s.item));
         self.mobile.controls.hold_uses_item = self.mobile_hold_uses_item();
-        let delta = self.mobile.controls.update(
-            t.id,
-            n,
-            t.phase == TouchPhase::Started,
-            matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled),
-        );
+        let delta = if t.phase == TouchPhase::Cancelled {
+            self.mobile.controls.cancel_finger(t.id);
+            [0.0; 2]
+        } else {
+            self.mobile.controls.update(
+                t.id,
+                n,
+                t.phase == TouchPhase::Started,
+                t.phase == TouchPhase::Ended,
+            )
+        };
         let turn = horizon_client::android_controls::camera_delta_with_mouse(
             delta,
             w,
@@ -1629,7 +1634,7 @@ impl Game<'_> {
     ) -> Result<bool> {
         self.mobile.ui.goy_mode = self.mobile.controls.settings.control_style
             == horizon_client::android_controls::ControlStyle::GoyControl;
-        if t.phase == TouchPhase::Ended
+        if matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled)
             && let Some((right, last)) = self.mobile.ui.release_mouse(t.id)
         {
             if last {
@@ -1637,12 +1642,9 @@ impl Game<'_> {
             }
             return Ok(true);
         }
-        if t.phase == TouchPhase::Cancelled {
-            self.mobile.ui.cancel();
-            self.android_release_touch_keys(true);
-            return Ok(true);
-        }
-        if t.phase == TouchPhase::Ended && self.mobile.ui.owns_key(t.id) {
+        if matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled)
+            && self.mobile.ui.owns_key(t.id)
+        {
             if let Some(key) = self.mobile.ui.key_up(t.id) {
                 self.android_key_up(key);
             }
@@ -2314,6 +2316,9 @@ impl Game<'_> {
         let Some(b) = self.gui_scale() else {
             return;
         };
+        if t.phase == TouchPhase::Cancelled {
+            self.mobile.vm_drag_pickup_slot = None;
+        }
         let prev_cursor = self.cursor;
         let position = self.mobile.ui.relative_touch(
             t.id,

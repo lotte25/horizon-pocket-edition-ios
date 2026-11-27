@@ -168,10 +168,14 @@ pub fn screen_direction(
     ray.map(|v| v / length)
 }
 
+/// Extra upward touch margin (GUI pixels) above the hotbar, matching Classic PE's reach so
+/// thumbs don't have to hit the very bottom edge of the screen.
+const HOTBAR_REACH: f32 = 8.0;
+
 pub fn hotbar_slot(width: f32, height: f32, point: [f32; 2]) -> Option<usize> {
     let x = point[0] - (width / 2.0 - 90.0);
-    (point[1] >= height - 22.0 && point[1] < height && (0.0..180.0).contains(&x))
-        .then(|| (x / 20.0) as usize)
+    let top = (height - 22.0 - HOTBAR_REACH).max(0.0);
+    (point[1] >= top && point[1] < height && (0.0..180.0).contains(&x)).then(|| (x / 20.0) as usize)
 }
 #[derive(Clone, Copy)]
 enum Role {
@@ -1283,6 +1287,18 @@ impl TouchControls {
             return delta;
         }
         [0.0; 2]
+    }
+    /// Cancel a single finger (OS touch cancellation) without triggering a tap, latching zoom,
+    /// or disturbing any other active fingers.
+    pub fn cancel_finger(&mut self, id: u64) {
+        self.passthrough_fingers.remove(&id);
+        if self.zoom_finger.is_some_and(|(finger, _)| finger == id) {
+            self.zoom_finger = None;
+        }
+        if self.custom_update(id, [0.0; 2], false, true) {
+            return;
+        }
+        self.fingers.remove(&id);
     }
     pub fn clear(&mut self) {
         self.cancel_editor_gesture();
@@ -3472,8 +3488,37 @@ mod tests {
                 hotbar_slot(427.0, 240.0, [133.5 + i as f32 * 20.0, 230.0]),
                 Some(i)
             );
+            // Slightly above the 22px hotbar still selects the slot (within HOTBAR_REACH).
+            assert_eq!(
+                hotbar_slot(427.0, 240.0, [133.5 + i as f32 * 20.0, 212.0]),
+                Some(i)
+            );
         }
+        assert_eq!(hotbar_slot(427.0, 240.0, [213.5, 209.0]), None);
         assert_eq!(hotbar_slot(427.0, 240.0, [320.0, 230.0]), None);
+    }
+    #[test]
+    fn cancel_finger_preserves_other_fingers_and_suppresses_tap() {
+        let mut c = TouchControls::default();
+        c.viewport(1920, 1080);
+        c.settings.mode = Mode::Dpad;
+        let move_center = c.placement(Control::Move).center;
+        let up = [move_center[0], move_center[1] - 0.08];
+        // Finger 1 holds Forward on the D-pad.
+        c.update(1, up, true, false);
+        assert!(c.state().left[1] > 0.5);
+        // Finger 2 starts on the world, then gets cancelled by the OS.
+        c.update(2, [0.75, 0.5], true, false);
+        c.cancel_finger(2);
+        // Finger 1 must stay active and Finger 2 must not fire a spurious tap.
+        assert!(c.state().left[1] > 0.5);
+        assert!(c.take_tap().is_none());
+        // Cancelled zoom finger must not latch zoom on.
+        c.zoom_available = true;
+        let zoom_center = c.placement(Control::Zoom).center;
+        c.update(3, zoom_center, true, false);
+        c.cancel_finger(3);
+        assert!(!c.zoom_held());
     }
     #[test]
     fn manual_input_selection_survives_profiles_and_ignores_other_device_activity() {

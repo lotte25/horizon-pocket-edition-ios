@@ -43,7 +43,14 @@ declare_class!(
         fn view_did_appear(&self, animated: bool) {
             let _: () = unsafe { msg_send![super(self), viewDidAppear: animated] };
             // A full-screen launcher stole first responder; restore gameplay keyboard focus.
-            if let Some(view) = self.view() { unsafe { view.becomeFirstResponder(); } }
+            if let Some(view) = self.view() {
+                unsafe {
+                    view.becomeFirstResponder();
+                }
+            }
+            if app_state::os_capabilities().defer_system_gestures {
+                self.setNeedsUpdateOfScreenEdgesDeferringSystemGestures();
+            }
         }
 
         #[method(shouldAutorotate)]

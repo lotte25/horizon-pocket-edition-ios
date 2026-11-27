@@ -7,11 +7,11 @@ use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
 use objc2_ui_kit::{
-    UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
-    UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
-    UIPanGestureRecognizer, UIPinchGestureRecognizer, UIPress, UIPressesEvent, UIResponder,
-    UIRotationGestureRecognizer, UITapGestureRecognizer, UITextInputTraits, UITouch, UITouchPhase,
-    UITouchType, UITraitEnvironment, UIView,
+    UICoordinateSpace, UIEditingInteractionConfiguration, UIEvent, UIForceTouchCapability,
+    UIGestureRecognizer, UIGestureRecognizerDelegate, UIGestureRecognizerState,
+    UIHoverGestureRecognizer, UIKeyInput, UIPanGestureRecognizer, UIPinchGestureRecognizer,
+    UIPress, UIPressesEvent, UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer,
+    UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
 };
 
 use super::app_state::{self, EventWrapper};
@@ -376,6 +376,14 @@ declare_class!(
         fn can_become_first_responder(&self) -> bool {
             true
         }
+
+        // WinitView stays first responder during gameplay for hardware keyboard events.
+        // Opt out of iOS's 3-finger text-editing gestures (Undo/Redo/Copy/Paste) so
+        // multi-touch gameplay never gets hijacked and cancelled by UIKit.
+        #[method(editingInteractionConfiguration)]
+        fn editing_interaction_configuration(&self) -> UIEditingInteractionConfiguration {
+            UIEditingInteractionConfiguration::None
+        }
     }
 
     unsafe impl NSObjectProtocol for WinitView {}
@@ -438,6 +446,11 @@ impl WinitView {
                 Some(sel!(hardwareHover:)),
             )
         };
+        unsafe {
+            hover.setCancelsTouchesInView(false);
+            hover.setDelaysTouchesBegan(false);
+            hover.setDelaysTouchesEnded(false);
+        }
         this.addGestureRecognizer(&hover);
 
         if let Some(scale_factor) = window_attributes.platform_specific.scale_factor {

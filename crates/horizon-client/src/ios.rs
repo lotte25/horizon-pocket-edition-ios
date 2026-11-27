@@ -36,17 +36,18 @@ thread_local! {
 }
 
 /// The command line of the next start.
-/// The game's window on an iPhone or iPad: the home bar fades away while it isn't touched, and
-/// a swipe or tap at the bottom or top edge goes to the game first (the system's own gesture
-/// needs a second one there), so a thumb near the edge doesn't open Type to Siri, the app
-/// switcher or the Control Center in the middle of play.
+/// The game's window on an iPhone or iPad: defer system edge gestures on all four edges so a
+/// thumb on the D-pad, jump button, or hotbar reaches the game immediately without iOS delaying
+/// edge touches or opening the app switcher / Control Center on the first swipe. Note: UIKit's
+/// `prefersHomeIndicatorAutoHidden` conflicts with bottom-edge gesture deferral, so keep it off
+/// and let `preferredScreenEdgesDeferringSystemGestures(ScreenEdge::ALL)` dim and guard the bar.
 pub fn window_attributes(
     attributes: winit::window::WindowAttributes,
 ) -> winit::window::WindowAttributes {
     use winit::platform::ios::{ScreenEdge, WindowAttributesExtIOS};
     attributes
-        .with_prefers_home_indicator_hidden(true)
-        .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::BOTTOM | ScreenEdge::TOP)
+        .with_prefers_home_indicator_hidden(false)
+        .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
 }
 
 pub fn set_args(args: Vec<String>) {
