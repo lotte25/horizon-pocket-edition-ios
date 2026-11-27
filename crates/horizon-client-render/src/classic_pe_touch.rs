@@ -1047,6 +1047,13 @@ pub struct ClassicPeState {
     pub touches: ClassicPeTouches,
     pub editor: ClassicPeEditor,
     pub sneak_toggled: bool,
+    /// Separate RightClick button toggled shield raised (when `shield_toggle` is enabled).
+    pub shield_toggled: bool,
+    /// Suppresses RightClick trigger while the finger that toggled `shield_toggled` off is down.
+    right_click_toggled_off: bool,
+    /// Short window after pressing RightClick in toggle mode during which active shield blocking
+    /// latches `shield_toggled = true` (covers taps shorter than one 20 Hz game tick).
+    right_click_shield_arm: Option<Instant>,
     pub more_open: bool,
     pub hidden: bool,
     pub player_list_open: bool,
@@ -1130,6 +1137,9 @@ impl ClassicPeState {
     pub fn reset_active(&mut self) {
         let _ = self.touches.release_all();
         self.sneak_toggled = false;
+        self.shield_toggled = false;
+        self.right_click_toggled_off = false;
+        self.right_click_shield_arm = None;
         self.holding_use = false;
         self.zoom_press_started = None;
         self.tap_pulse = None;
@@ -1224,7 +1234,16 @@ impl ClassicPeState {
                         self.pending_pad.triggers[1] = 1.0;
                     }
                     ClassicPeControl::RightClick => {
-                        self.pending_pad.triggers[0] = 1.0;
+                        if self.shield_toggled {
+                            self.shield_toggled = false;
+                            self.right_click_shield_arm = None;
+                            self.right_click_toggled_off = true;
+                        } else {
+                            self.right_click_toggled_off = false;
+                            self.right_click_shield_arm =
+                                Some(Instant::now() + Duration::from_millis(120));
+                            self.pending_pad.triggers[0] = 1.0;
+                        }
                     }
                     ClassicPeControl::Debug => {
                         ev.debug = true;
@@ -1254,6 +1273,11 @@ impl ClassicPeState {
                     }
                     ClassicPeControl::ToggleActionButtons => {
                         self.config.show_action_buttons = !self.config.show_action_buttons;
+                        if !self.config.show_action_buttons {
+                            self.shield_toggled = false;
+                            self.right_click_toggled_off = false;
+                            self.right_click_shield_arm = None;
+                        }
                         self.save(home);
                         ev.clicked = true;
                     }
@@ -1297,6 +1321,9 @@ impl ClassicPeState {
                             self.zoom_toggled = false;
                         }
                     }
+                }
+                TouchOut::Release(ClassicPeControl::RightClick) => {
+                    self.right_click_toggled_off = false;
                 }
                 TouchOut::Release(_) => {}
                 TouchOut::Look(dx, dy) => {
@@ -1345,6 +1372,9 @@ impl ClassicPeState {
         entity_uses: bool,
         shield_available: bool,
         shield_button: bool,
+        shield_toggle: bool,
+        using_shield: bool,
+        using_other: bool,
         in_menu: bool,
         focused: bool,
     ) -> FrameUpdate {
@@ -1403,30 +1433,59 @@ impl ClassicPeState {
         if self.touches.held(ClassicPeControl::LeftClick) {
             pad.triggers[1] = 1.0;
         }
-        if self.touches.held(ClassicPeControl::RightClick) {
+        let right_click_held =
+            self.touches.held(ClassicPeControl::RightClick) && !self.right_click_toggled_off;
+        if right_click_held {
             pad.triggers[0] = 1.0;
         }
 
-        // 3. Sneak / FlyDown & passive crouch-to-shield:
+        // 3. Sneak / FlyDown, passive crouch-to-shield & toggleable separate RightClick shield:
         // - Without separate Attack/Use buttons (`!show_action_buttons`), Sneak always raises
         //   the shield (regardless of `shield_button`), because there is no Use button on screen.
         // - With separate Attack/Use buttons (`show_action_buttons`), Horizon's Touch Controls
-        //   setting (`shield_button`: Button vs Sneak) decides whether Sneak raises the shield.
-        // - Whenever the player actively attacks, mines, or uses/places, passive sneak-shield
-        //   yields immediately so interactions are never blocked.
+        //   setting (`shield_button`: Button vs Sneak) decides whether Sneak raises the shield,
+        //   and `shield_toggle` (Toggle vs Hold, default Toggle) decides whether tapping the
+        //   separate RightClick button latches the shield raised until tapped again.
+        // - Whenever the player actively attacks, mines, or uses/places, shield yields
+        //   immediately so interactions are never blocked.
         let sneaking = self.is_sneaking();
         let mining_pos = self.touches.active_mine_pos();
         let sneak_raises_shield = !self.config.show_action_buttons || !shield_button;
-        let shield_yielding = self.touches.held(ClassicPeControl::LeftClick)
-            || self.touches.held(ClassicPeControl::RightClick)
+        let action_yielding = self.touches.held(ClassicPeControl::LeftClick)
             || mining_pos.is_some()
             || self.shield_yield_until.is_some_and(|u| Instant::now() < u);
         let sneak_shield = sneak_raises_shield
             && sneaking
             && shield_available
             && !vertical_movement
-            && !shield_yielding;
-        if sneak_shield {
+            && !action_yielding
+            && !right_click_held;
+
+        if !shield_toggle || !shield_available || !self.config.show_action_buttons || using_other {
+            self.shield_toggled = false;
+            self.right_click_shield_arm = None;
+        } else if hold_uses_item || entity_uses || sneak_shield {
+            self.right_click_shield_arm = None;
+        } else if let Some(until) = self.right_click_shield_arm {
+            if using_shield {
+                self.shield_toggled = true;
+                self.right_click_shield_arm = None;
+            } else if Instant::now() >= until {
+                self.right_click_shield_arm = None;
+            } else {
+                // Keep use held across one game tick so a quick tap on RightClick still raises
+                // the shield and latches it.
+                pad.triggers[0] = 1.0;
+            }
+        }
+
+        let toggled_shield = self.shield_toggled
+            && shield_toggle
+            && shield_available
+            && self.config.show_action_buttons
+            && !action_yielding;
+        let active_shield = sneak_shield || toggled_shield;
+        if active_shield {
             pad.triggers[0] = 1.0;
         }
 
@@ -1462,7 +1521,7 @@ impl ClassicPeState {
         FrameUpdate {
             pad,
             sneaking,
-            sneak_shield,
+            sneak_shield: active_shield,
             zoom_active: self.zoom_active(),
             aim_norm: self.aim_norm(),
             holding_use: self.holding_use,
@@ -1690,6 +1749,7 @@ impl ClassicPeState {
             let held = !editing && self.touches.held(control);
             let active = match control {
                 ClassicPeControl::Sneak => self.sneak_toggled,
+                ClassicPeControl::RightClick => self.shield_toggled,
                 ClassicPeControl::More => self.more_open,
                 ClassicPeControl::PlayerList => self.player_list_open,
                 ClassicPeControl::ToggleActionButtons => self.config.show_action_buttons,
@@ -2618,35 +2678,115 @@ mod tests {
 
         // 1. Without ATK buttons (`show_action_buttons=false`), Sneak ALWAYS raises shield
         // regardless of `shield_button=true` (no Use button on screen).
-        let upd = st.frame_update(size, 0.0, false, false, false, true, true, false, true);
+        let upd = st.frame_update(
+            size, 0.0, false, false, false, true, true, true, false, false, false, true,
+        );
         assert!(upd.sneaking && upd.sneak_shield && upd.pad.triggers[0] == 1.0);
 
         // 2. Yielding for a tap (attack or place/use) drops passive sneak-shield immediately.
         st.yield_shield(250);
-        let yielded = st.frame_update(size, 0.0, false, false, false, true, true, false, true);
+        let yielded = st.frame_update(
+            size, 0.0, false, false, false, true, true, true, false, false, false, true,
+        );
         assert!(yielded.sneaking && !yielded.sneak_shield && yielded.pad.triggers[0] == 0.0);
         st.shield_yield_until = None;
 
         // 3. With ATK buttons ON (`show_action_buttons=true`) and `shield_button=true` ("Button"),
         // Sneak does NOT raise shield (RightClick button raises shield instead).
         st.config.show_action_buttons = true;
-        let separate = st.frame_update(size, 0.0, false, false, false, true, true, false, true);
+        let separate = st.frame_update(
+            size, 0.0, false, false, false, true, true, true, false, false, false, true,
+        );
         assert!(separate.sneaking && !separate.sneak_shield && separate.pad.triggers[0] == 0.0);
 
         // 4. With ATK buttons ON and `shield_button=false` ("Sneak"), Sneak raises shield,
         // and holding LeftClick (Attack) yields the passive sneak-shield so attacks/mining work.
-        let sneak_mode = st.frame_update(size, 0.0, false, false, false, true, false, false, true);
+        let sneak_mode = st.frame_update(
+            size, 0.0, false, false, false, true, false, true, false, false, false, true,
+        );
         assert!(sneak_mode.sneak_shield && sneak_mode.pad.triggers[0] == 1.0);
         let layout_atk = bedrock_layout(size.0, size.1, &st.config, opts);
         let atk_pos = center(&layout_atk, ClassicPeControl::LeftClick);
         st.touch_event(2, TouchPhaseKind::Started, atk_pos, size, opts, false, home);
-        let attacking = st.frame_update(size, 0.0, false, false, false, true, false, false, true);
+        let attacking = st.frame_update(
+            size, 0.0, false, false, false, true, false, true, false, false, false, true,
+        );
         assert!(
             !attacking.sneak_shield
                 && attacking.pad.triggers[0] == 0.0
                 && attacking.pad.triggers[1] == 1.0
         );
         st.touch_event(2, TouchPhaseKind::Ended, atk_pos, size, opts, false, home);
+    }
+
+    #[test]
+    fn separate_right_click_shield_supports_toggle_and_hold_modes() {
+        let mut st = ClassicPeState::default();
+        st.config_loaded = true;
+        st.config.show_action_buttons = true;
+        let size = (480.0, 270.0);
+        let opts = st.layout_options(false, false, false, false);
+        let layout = bedrock_layout(size.0, size.1, &st.config, opts);
+        let use_pos = center(&layout, ClassicPeControl::RightClick);
+        let atk_pos = center(&layout, ClassicPeControl::LeftClick);
+        let home = Path::new(".");
+
+        // Toggle mode (`shield_toggle=true`): tap RightClick -> tick starts blocking (`using_shield=true`)
+        // -> shield stays raised even after releasing the button.
+        st.touch_event(1, TouchPhaseKind::Started, use_pos, size, opts, false, home);
+        st.touch_event(1, TouchPhaseKind::Ended, use_pos, size, opts, false, home);
+        // Quick tap stays armed across the first frame until the game tick raises the shield.
+        let armed = st.frame_update(
+            size, 0.0, false, false, false, true, true, true, false, false, false, true,
+        );
+        assert_eq!(armed.pad.triggers[0], 1.0);
+        // Once game reports `using_shield=true`, toggle latches on.
+        let latched = st.frame_update(
+            size, 0.0, false, false, false, true, true, true, true, false, false, true,
+        );
+        assert!(st.shield_toggled && latched.sneak_shield && latched.pad.triggers[0] == 1.0);
+
+        // Attacking yields the toggled shield immediately so swings/mining are never blocked.
+        st.touch_event(2, TouchPhaseKind::Started, atk_pos, size, opts, false, home);
+        let attacking = st.frame_update(
+            size, 0.0, false, false, false, true, true, true, true, false, false, true,
+        );
+        assert!(
+            !attacking.sneak_shield
+                && attacking.pad.triggers[0] == 0.0
+                && attacking.pad.triggers[1] == 1.0
+        );
+        st.touch_event(2, TouchPhaseKind::Ended, atk_pos, size, opts, false, home);
+
+        // Second tap on RightClick toggles shield OFF immediately (does not re-raise while held).
+        st.touch_event(3, TouchPhaseKind::Started, use_pos, size, opts, false, home);
+        let toggled_off = st.frame_update(
+            size, 0.0, false, false, false, true, true, true, true, false, false, true,
+        );
+        assert!(
+            !st.shield_toggled && !toggled_off.sneak_shield && toggled_off.pad.triggers[0] == 0.0
+        );
+        st.touch_event(3, TouchPhaseKind::Ended, use_pos, size, opts, false, home);
+
+        // Using a non-shield item (food/bow: `using_other=true`) never latches shield toggle.
+        st.touch_event(4, TouchPhaseKind::Started, use_pos, size, opts, false, home);
+        let _ = st.frame_update(
+            size, 0.0, false, true, false, true, true, true, false, true, false, true,
+        );
+        st.touch_event(4, TouchPhaseKind::Ended, use_pos, size, opts, false, home);
+        assert!(!st.shield_toggled);
+
+        // Hold mode (`shield_toggle=false`): raises only while held, lowers immediately on release.
+        st.touch_event(5, TouchPhaseKind::Started, use_pos, size, opts, false, home);
+        let held = st.frame_update(
+            size, 0.0, false, false, false, true, true, false, true, false, false, true,
+        );
+        assert!(!st.shield_toggled && held.pad.triggers[0] == 1.0);
+        st.touch_event(5, TouchPhaseKind::Ended, use_pos, size, opts, false, home);
+        let released = st.frame_update(
+            size, 0.0, false, false, false, true, true, false, true, false, false, true,
+        );
+        assert!(!st.shield_toggled && !released.sneak_shield && released.pad.triggers[0] == 0.0);
     }
 
     #[test]

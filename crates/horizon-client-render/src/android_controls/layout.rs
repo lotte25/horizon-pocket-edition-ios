@@ -511,6 +511,10 @@ pub struct Settings {
     pub invert_y: bool,
     pub offhand_button: bool,
     pub shield_button: bool,
+    /// Whether the shield button (and Classic PE separate right-click when blocking) is
+    /// toggleable (`true`, default) or hold-to-raise (`false`).
+    #[serde(default = "default_shield_toggle")]
+    pub shield_toggle: bool,
     pub circle_size: f32,
     pub button_scale: f32,
     pub custom_buttons: Vec<super::CustomButton>,
@@ -610,6 +614,9 @@ fn default_goy_preset_desc() -> String {
 fn default_feedback_enabled() -> bool {
     true
 }
+fn default_shield_toggle() -> bool {
+    true
+}
 fn default_floating_pos() -> [f32; 2] {
     [0.44, 0.05]
 }
@@ -707,6 +714,7 @@ impl Default for Settings {
             invert_y: false,
             offhand_button: false,
             shield_button: true,
+            shield_toggle: true,
             circle_size: 32.0,
             button_scale: 1.0,
             custom_buttons: Vec::new(),

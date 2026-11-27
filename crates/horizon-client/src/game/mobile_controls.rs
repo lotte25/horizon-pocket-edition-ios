@@ -324,8 +324,14 @@ impl Game<'_> {
                 || self.riding.is_some();
             let zoom_mod = self.mod_key_ready(super::mod_keys::ZOOM.mod_id);
             let waypoint_mod = self.waypoint_mod_ready();
+            let using_shield = self
+                .using
+                .and_then(|(slot, _)| self.stack_in(slot))
+                .is_some_and(|s| self.blocks_attacks(s).is_some());
+            let using_other = self.using.is_some() && !using_shield;
             let tc = &mut self.mobile.controls;
             let shield_button = tc.settings.shield_button;
+            let shield_toggle = tc.settings.shield_toggle;
             tc.shield_available = shield_available;
             tc.zoom_available = zoom_mod;
             tc.waypoints_available = waypoint_mod;
@@ -352,6 +358,9 @@ impl Game<'_> {
                 entity_use,
                 shield_available,
                 shield_button,
+                shield_toggle,
+                using_shield,
+                using_other,
                 in_menu || self.mobile.ui.floating_menu,
                 self.focused,
             );

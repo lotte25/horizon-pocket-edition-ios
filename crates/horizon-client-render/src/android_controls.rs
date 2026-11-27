@@ -265,6 +265,8 @@ pub struct TouchControls {
     last_marker: Option<([f32; 2], Instant)>,
     last_sneak_tap: Option<Instant>,
     sprint_latched: bool,
+    /// Shield left raised by a tap of its button when `shield_toggle` is enabled.
+    shield_latched: bool,
 }
 
 impl Default for TouchControls {
@@ -320,6 +322,7 @@ impl Default for TouchControls {
             last_marker: None,
             last_sneak_tap: None,
             sprint_latched: false,
+            shield_latched: false,
         }
     }
 }
@@ -910,7 +913,11 @@ impl TouchControls {
                         } else {
                             "Shield"
                         };
-                        text_button(b, a, bounds, label, pressed, color, false);
+                        let active = pressed
+                            || (control == Control::Shield
+                                && self.editor.is_none()
+                                && self.shield_held());
+                        text_button(b, a, bounds, label, active, color, false);
                     }
                     // Over an inventory, Sneak is Shift (quick move): the Shift key's arrow,
                     // filled while Shift is down.
@@ -999,10 +1006,11 @@ impl TouchControls {
     pub fn shield_held(&self) -> bool {
         self.settings.shield_button
             && self.shield_available
-            && self
-                .fingers
-                .values()
-                .any(|(role, _)| matches!(role, Role::Shield))
+            && ((self.settings.shield_toggle && self.shield_latched)
+                || self
+                    .fingers
+                    .values()
+                    .any(|(role, _)| matches!(role, Role::Shield)))
     }
     pub fn pointer(&self) -> Option<[f32; 2]> {
         if self.crosshair() {
@@ -1111,8 +1119,19 @@ impl TouchControls {
                         self.passthrough_fingers.insert(id);
                     }
                     self.clicked = true;
-                    self.pending.triggers[0] = 1.0;
-                    Role::Shield
+                    if self.settings.shield_toggle {
+                        self.shield_latched = !self.shield_latched;
+                        if self.shield_latched {
+                            self.pending.triggers[0] = 1.0;
+                            Role::Shield
+                        } else {
+                            Role::Ignore
+                        }
+                    } else {
+                        self.shield_latched = false;
+                        self.pending.triggers[0] = 1.0;
+                        Role::Shield
+                    }
                 }
                 Some(Control::Offhand) => {
                     self.clicked = true;
@@ -1274,6 +1293,7 @@ impl TouchControls {
         self.latched_controls = 0;
         self.last_sneak_tap = None;
         self.sprint_latched = false;
+        self.shield_latched = false;
         self.pending = PadState::default();
         self.aim = None;
         self.tap_aim = None;
@@ -1348,6 +1368,16 @@ impl TouchControls {
                     }
                 }
             }
+        }
+        if !self.shield_available
+            || !self.settings.shield_button
+            || !self.settings.shield_toggle
+            || self.in_menu
+        {
+            self.shield_latched = false;
+        }
+        if self.shield_held() {
+            state.triggers[0] = 1.0;
         }
         state
     }
@@ -2635,6 +2665,8 @@ mod tests {
         t.settings.mode = Mode::Tap;
         t.settings.shield_button = true;
         t.shield_available = true;
+        // Default: toggleable (first tap latches shield on, second tap lowers it).
+        assert!(t.settings.shield_toggle);
         let p = t.placement(Control::Shield).center;
         t.update(2, p, true, false);
         assert!(t.shield_held());
@@ -2642,6 +2674,20 @@ mod tests {
         assert!(t.shield_held());
         assert!(t.poll_state().triggers[0] > 0.0);
         t.update(2, [0.5, 0.4], false, true);
+        assert!(t.shield_held());
+        assert!(t.poll_state().triggers[0] > 0.0);
+        // Second tap turns it off.
+        t.update(3, p, true, false);
+        assert!(!t.shield_held());
+        assert_eq!(t.poll_state().triggers[0], 0.0);
+        t.update(3, p, false, true);
+        assert!(!t.shield_held());
+        // Hold mode: releasing the button lowers the shield immediately.
+        t.settings.shield_toggle = false;
+        t.update(4, p, true, false);
+        assert!(t.shield_held());
+        assert!(t.poll_state().triggers[0] > 0.0);
+        t.update(4, [0.5, 0.4], false, true);
         assert!(!t.shield_held());
         assert_eq!(t.poll_state().triggers[0], 0.0);
     }
@@ -2662,6 +2708,7 @@ mod tests {
         for mode in [Mode::Tap, Mode::Dpad] {
             t.clear();
             t.settings.mode = mode;
+            t.settings.shield_toggle = false;
             assert!(t.visible(Control::Shield));
             let p = t.placement(Control::Shield).center;
             t.update(2, p, true, false);

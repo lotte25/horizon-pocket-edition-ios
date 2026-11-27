@@ -237,6 +237,7 @@ impl Opt {
             Opt::TouchKeyboardButton => "Keyboard Button",
             Opt::TouchOffhand => "Swap hands button",
             Opt::TouchShield => "Raise shield with",
+            Opt::TouchShieldToggle => "Shield button",
             Opt::TouchButtonScale => "Control button size",
             Opt::TouchInteract => "Interact button",
             Opt::TouchLeftHand => "Left handed",
@@ -595,6 +596,14 @@ impl Opt {
                     "Button"
                 } else {
                     "Sneak"
+                }
+                .into(),
+            ),
+            Opt::TouchShieldToggle => Some(
+                if s.touch.shield_toggle {
+                    "Toggle"
+                } else {
+                    "Hold"
                 }
                 .into(),
             ),
@@ -1174,6 +1183,7 @@ impl Opt {
             Opt::TouchKeyboardButton => s.touch.keyboard_button ^= true,
             Opt::TouchOffhand => s.touch.offhand_button ^= true,
             Opt::TouchShield => s.touch.shield_button ^= true,
+            Opt::TouchShieldToggle => s.touch.shield_toggle ^= true,
             Opt::TouchLeftHand => s.touch.left_handed ^= true,
             Opt::TouchSprintButton => s.touch.sprint_button ^= true,
             Opt::TouchSprintToggle => s.touch.sprint_toggle ^= true,
@@ -3897,6 +3907,7 @@ impl OptionsUi {
                     Opt::TouchKeyboardButton,
                     Opt::TouchOffhand,
                     Opt::TouchShield,
+                    Opt::TouchShieldToggle,
                     Opt::TouchButtonScale,
                     Opt::TouchCircleSize,
                     Opt::TouchAttackSide,
