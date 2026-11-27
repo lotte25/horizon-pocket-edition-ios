@@ -203,6 +203,14 @@ impl Game<'_> {
     pub(in crate::game) fn mobile_options_apply(&mut self) {
         self.mobile.controls.settings = self.settings.touch.clone();
         self.mobile.ui.menu_direct_pointer = self.settings.touch.virtual_mouse_hidden;
+        if self.mobile.is_classic_pe()
+            && self.mobile.classic_pe.config.split_controls != self.settings.touch.split_controls
+        {
+            self.mobile.classic_pe.config.split_controls = self.settings.touch.split_controls;
+            self.mobile
+                .classic_pe
+                .save(&horizon_client::logging::game_home());
+        }
         self.input_used(self.input_mode);
         if let Err(e) = self.mobile.controls.settings.save() {
             log::warn!("Controls settings: {e}");
@@ -211,6 +219,9 @@ impl Game<'_> {
     pub(in crate::game) fn mobile_options_open(&mut self) {
         self.mobile_init();
         self.settings.touch = self.mobile.controls.settings.clone();
+        if self.mobile.is_classic_pe() {
+            self.settings.touch.split_controls = self.mobile.classic_pe.config.split_controls;
+        }
     }
     fn mobile_init(&mut self) {
         if self.mobile.loaded {
@@ -252,14 +263,11 @@ impl Game<'_> {
             .as_ref()
             .is_some_and(|p| p.flying || p.swimming || p.spectator)
             || self.riding.is_some();
-        let shield_available =
-            self.mobile.controls.shield_available && self.mobile.controls.settings.shield_button;
         let zoom_available = self.mobile.controls.zoom_available;
         let waypoints_available = self.mobile.controls.waypoints_available;
         let voice_available = self.voice.enabled();
         self.mobile.classic_pe.layout_options(
             vertical,
-            shield_available,
             zoom_available,
             waypoints_available,
             voice_available,
@@ -335,6 +343,7 @@ impl Game<'_> {
             let size = self
                 .gui_scale()
                 .map_or((427.0, 240.0), |b| (b.width, b.height));
+            let was_touch_shield = self.mobile.touch_shield;
             let upd = self.mobile.classic_pe.frame_update(
                 size,
                 breaking,
@@ -347,7 +356,12 @@ impl Game<'_> {
                 self.focused,
             );
             self.mobile.touch_aim = upd.aim_norm;
-            self.mobile.touch_shield = shown && !in_menu && upd.shield_held;
+            self.mobile.touch_shield = shown && !in_menu && upd.sneak_shield;
+            // When passive sneak-to-shield yields (e.g., to mine, attack, or use), release the
+            // active shield right away so the player's interaction executes on this very tick.
+            if was_touch_shield && !self.mobile.touch_shield && self.using.is_some() {
+                self.release_remote_use();
+            }
             let lost = upd.sneaking && !self.keys.contains(&KeyCode::ShiftLeft);
             if upd.sneaking != self.mobile.classic_pe_sneaking || lost {
                 let pressed = upd.sneaking && !self.mobile.classic_pe_sneaking;
@@ -430,9 +444,14 @@ impl Game<'_> {
             tc.poll_state()
         };
         self.mobile.touch_aim = tc.aim.or(self.mobile.touch_aim);
+        let was_touch_shield = self.mobile.touch_shield;
+        let tap = tc.take_tap();
+        let modern_sneak_shield_yield =
+            !tc.settings.shield_button && (tap.is_some() || tc.holding || state.triggers[1] > 0.5);
         self.mobile.touch_shield = shown
             && !in_menu
             && shield_available
+            && !modern_sneak_shield_yield
             && if tc.settings.shield_button {
                 tc.shield_held()
             } else {
@@ -445,7 +464,6 @@ impl Game<'_> {
             state.triggers = [1., 0.];
             tc.latch_use();
         }
-        let tap = tc.take_tap();
 
         let chat = std::mem::take(&mut tc.chat_requested);
         let perspective = std::mem::take(&mut tc.perspective_requested);
@@ -456,6 +474,9 @@ impl Game<'_> {
         let add_waypoint = std::mem::take(&mut tc.add_waypoint_requested);
         // Zoomed while the button says so (tapped on, or a finger on it), in play.
         let zoom = tc.zoom_held() && !in_menu && !editing && self.focused;
+        if was_touch_shield && !self.mobile.touch_shield && self.using.is_some() {
+            self.release_remote_use();
+        }
         if let Some(held_use) = tap {
             if self.pick_entity_hit().is_some()
                 && self.using.is_none()
@@ -549,11 +570,12 @@ impl Game<'_> {
             }
             self.mobile.ui.draw_keyboard(b, &self.gui.atlas);
             if self.mobile.ui.virtual_mouse {
-                ui::draw_pointer(
+                ui::draw_pointer_held(
                     b,
                     &self.gui.atlas,
                     self.cursor,
                     tc.settings.virtual_mouse_pointer_scale,
+                    self.mobile.ui.virtual_mouse_held_button(),
                 );
             }
             return;
@@ -575,11 +597,12 @@ impl Game<'_> {
         ui::draw_hud_editor(tc, b, &self.gui.atlas, &tc.settings.preset_id, None);
         self.mobile.ui.draw_keyboard(b, &self.gui.atlas);
         if self.mobile.ui.virtual_mouse {
-            ui::draw_pointer(
+            ui::draw_pointer_held(
                 b,
                 &self.gui.atlas,
                 self.cursor,
                 tc.settings.virtual_mouse_pointer_scale,
+                self.mobile.ui.virtual_mouse_held_button(),
             );
         }
     }
@@ -607,14 +630,23 @@ impl Game<'_> {
             };
             let opts = self.classic_pe_layout_options();
             let home = horizon_client::logging::game_home();
+            let prev_split = self.mobile.classic_pe.config.split_controls;
+            let attack_button_look = self.mobile.controls.settings.attack_button_look;
             let ev = self.mobile.classic_pe.touch_event(
                 t.id,
                 phase,
                 (p[0], p[1]),
                 (b.width, b.height),
                 opts,
+                attack_button_look,
                 &home,
             );
+            if self.mobile.classic_pe.config.split_controls != prev_split {
+                let split = self.mobile.classic_pe.config.split_controls;
+                self.mobile.controls.settings.split_controls = split;
+                self.settings.touch.split_controls = split;
+                let _ = self.mobile.controls.settings.save();
+            }
             if ev.clicked {
                 self.audio.play_button_click();
                 self.android_touch_haptic(10);
@@ -745,14 +777,23 @@ impl Game<'_> {
             };
             let opts = self.classic_pe_layout_options();
             let home = horizon_client::logging::game_home();
+            let prev_split = self.mobile.classic_pe.config.split_controls;
+            let attack_button_look = self.mobile.controls.settings.attack_button_look;
             let ev = self.mobile.classic_pe.touch_event(
                 t.id,
                 phase,
                 (p[0], p[1]),
                 (b.width, b.height),
                 opts,
+                attack_button_look,
                 &home,
             );
+            if self.mobile.classic_pe.config.split_controls != prev_split {
+                let split = self.mobile.classic_pe.config.split_controls;
+                self.mobile.controls.settings.split_controls = split;
+                self.settings.touch.split_controls = split;
+                let _ = self.mobile.controls.settings.save();
+            }
             if ev.clicked {
                 self.audio.play_button_click();
                 self.android_touch_haptic(10);
@@ -840,6 +881,15 @@ impl Game<'_> {
             }
             if ev.tap_world {
                 self.mobile.touch_aim = ev.tap_aim_norm;
+                // Yield passive crouch-to-shield so tapping a mob attacks it and tapping a block
+                // places/uses it immediately instead of being eaten by the raised shield.
+                if self.mobile.touch_shield {
+                    self.mobile.classic_pe.yield_shield(250);
+                    self.mobile.touch_shield = false;
+                    if self.using.is_some() {
+                        self.release_remote_use();
+                    }
+                }
                 if self.pick_entity_hit().is_some()
                     && self.using.is_none()
                     && self.screen == Screen::Playing
@@ -2273,16 +2323,58 @@ impl Game<'_> {
             },
             InputOrigin::User,
         );
-        if t.phase == TouchPhase::Ended {
+        if matches!(
+            t.phase,
+            TouchPhase::Moved | TouchPhase::Ended | TouchPhase::Cancelled
+        ) {
             self.android_virtual_mouse_clicks(events);
+        }
+    }
+    fn android_virtual_mouse_button(
+        &mut self,
+        events: &dyn super::event_loop::EventLoopCtl,
+        button: MouseButton,
+        down: bool,
+    ) {
+        if matches!(self.screen, Screen::Inventory | Screen::Creative) {
+            if let Err(e) = self.android_custom_mouse(button, down) {
+                log::warn!("Virtual mouse button: {e}");
+            }
+        } else if let Some(id) = self.window.as_ref().map(|w| w.id()) {
+            self.handle_window_event(
+                events,
+                id,
+                WindowEvent::MouseInput {
+                    device_id: DeviceId::dummy(),
+                    state: if down {
+                        ElementState::Pressed
+                    } else {
+                        ElementState::Released
+                    },
+                    button,
+                },
+                InputOrigin::User,
+            );
+        }
+        if button == MouseButton::Left && !down {
+            self.touch_field_click();
+            if self.on_text_field() == Some(true) {
+                self.android_show_keyboard();
+            }
         }
     }
     pub(super) fn android_virtual_mouse_clicks(
         &mut self,
         events: &dyn super::event_loop::EventLoopCtl,
     ) {
+        use horizon_client::android_control_ui::VirtualMouseEvent;
         if !self.focused || !self.mobile.ui.virtual_mouse {
             self.mobile.ui.cancel_relative();
+            for ev in self.mobile.ui.take_virtual_mouse_events(false) {
+                if let VirtualMouseEvent::Release(button) = ev {
+                    self.android_virtual_mouse_button(events, button, false);
+                }
+            }
             for right in self.mobile.ui.release_all_mouse() {
                 if let Some(id) = self.window.as_ref().map(|w| w.id())
                     && let Err(error) = self.android_menu_mouse(events, id, right, false)
@@ -2293,41 +2385,58 @@ impl Game<'_> {
             return;
         }
         if !self.pad_in_menu() {
+            for ev in self.mobile.ui.take_virtual_mouse_events(false) {
+                if let VirtualMouseEvent::Release(button) = ev {
+                    self.android_virtual_mouse_button(events, button, false);
+                }
+            }
             return;
         }
-        let Some(right) = self.mobile.ui.relative_click(true) else {
-            return;
-        };
-        let button = if right {
-            MouseButton::Right
-        } else {
-            MouseButton::Left
-        };
-        if matches!(self.screen, Screen::Inventory | Screen::Creative) {
-            if let Err(e) = self
-                .android_custom_mouse(button, true)
-                .and_then(|()| self.android_custom_mouse(button, false))
-            {
-                log::warn!("Virtual mouse click: {e}");
-            }
-        } else if let Some(id) = self.window.as_ref().map(|w| w.id()) {
-            for state in [ElementState::Pressed, ElementState::Released] {
-                self.handle_window_event(
-                    events,
-                    id,
-                    WindowEvent::MouseInput {
-                        device_id: DeviceId::dummy(),
-                        state,
-                        button,
-                    },
-                    InputOrigin::User,
-                );
-            }
-        }
-        if !right {
-            self.touch_field_click();
-            if self.on_text_field() == Some(true) {
-                self.android_show_keyboard();
+        let allow_clicks = !self.mobile.ui.mouse_held();
+        for ev in self.mobile.ui.take_virtual_mouse_events(allow_clicks) {
+            match ev {
+                VirtualMouseEvent::Press(button) => {
+                    self.android_virtual_mouse_button(events, button, true);
+                    self.android_touch_haptic(14);
+                }
+                VirtualMouseEvent::Release(button) => {
+                    self.android_virtual_mouse_button(events, button, false);
+                }
+                VirtualMouseEvent::Click(button) => {
+                    self.android_virtual_mouse_button(events, button, true);
+                    self.android_virtual_mouse_button(events, button, false);
+                }
+                VirtualMouseEvent::Scroll(dy) => {
+                    if self.screen == Screen::Options {
+                        if let Some(b) = self.gui_scale() {
+                            self.ui.options.scroll_at(
+                                &self.settings,
+                                (b.width, b.height),
+                                self.cursor,
+                                dy,
+                            );
+                        }
+                    } else if let Some(id) = self.window.as_ref().map(|w| w.id()) {
+                        self.handle_window_event(
+                            events,
+                            id,
+                            WindowEvent::MouseWheel {
+                                device_id: DeviceId::dummy(),
+                                delta: MouseScrollDelta::PixelDelta(
+                                    winit::dpi::PhysicalPosition::new(
+                                        0.,
+                                        f64::from(
+                                            dy * 30.
+                                                / self.settings.mouse_wheel_sensitivity.max(0.01),
+                                        ),
+                                    ),
+                                ),
+                                phase: TouchPhase::Moved,
+                            },
+                            InputOrigin::User,
+                        );
+                    }
+                }
             }
         }
     }

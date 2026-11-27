@@ -6,8 +6,27 @@ use crate::{
     android_control_keyboard::{Keyboard, Output},
     hud::{HudAtlas, HudBatch, rgba},
 };
-use std::{cell::Cell, collections::BTreeMap, time::Instant};
-use winit::{event::TouchPhase, keyboard::KeyCode};
+use std::{
+    cell::Cell,
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+use winit::{
+    event::{MouseButton, TouchPhase},
+    keyboard::KeyCode,
+};
+
+/// Hold duration before 1-finger (LMB) or 2-finger (RMB) hold-drag engages: matches touch-interact `HOLD_DELAY`.
+pub const VIRTUAL_MOUSE_HOLD_DELAY: Duration = Duration::from_millis(350);
+
+/// Events produced by the touch-anywhere virtual mouse trackpad.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VirtualMouseEvent {
+    Click(MouseButton),
+    Press(MouseButton),
+    Release(MouseButton),
+    Scroll(f32),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresetDialogState {
@@ -70,7 +89,7 @@ pub struct TouchUi {
     mouse_buttons: BTreeMap<u64, bool>,
     latched_modifiers: std::collections::HashSet<KeyCode>,
     relative: Option<RelativeTouch>,
-    relative_click: Option<bool>,
+    relative_events: Vec<VirtualMouseEvent>,
     pub keyboard: Option<Keyboard>,
     gesture: Option<(u64, [f32; 2], [f32; 2], bool)>,
     pointer_drag: Option<u64>,
@@ -119,7 +138,7 @@ impl Default for TouchUi {
             mouse_buttons: BTreeMap::new(),
             latched_modifiers: std::collections::HashSet::new(),
             relative: None,
-            relative_click: None,
+            relative_events: Vec::new(),
             keyboard: None,
             gesture: None,
             pointer_drag: None,
@@ -325,11 +344,19 @@ struct RelativeFinger {
 struct RelativeTouch {
     fingers: Vec<RelativeFinger>,
     cursor: [f32; 2],
-    /// At least two fingers were down simultaneously during this gesture.
-    multi_finger: bool,
-    /// Right click has already fired for the current multi-finger press.
-    right_sent: bool,
-    /// Clicks were allowed when this gesture began (false while an auxiliary mouse button is held).
+    /// Highest simultaneous finger count seen during this gesture (1, 2, or 3+).
+    max_fingers: u8,
+    /// When the current stationary finger group began (reset when a 2nd/3rd finger lands).
+    since: Instant,
+    /// Mouse button currently held down via hold-to-drag (`Left` or `Right`).
+    held_button: Option<MouseButton>,
+    /// Active 2-finger vertical scroll gesture.
+    scrolling: bool,
+    /// Last average Y of the two fingers during 2-finger scroll.
+    scroll_last_y: f32,
+    /// Multi-finger tap click has already fired for the current press group.
+    multi_fired: bool,
+    /// Clicks/holds were allowed when this gesture began (false while an auxiliary mouse button is held).
     clicks_allowed: bool,
 }
 pub enum Gesture {
@@ -483,6 +510,72 @@ pub fn draw_pointer(batch: &mut HudBatch, atlas: &HudAtlas, cursor: (f32, f32), 
         ],
         fill,
     );
+}
+
+/// Draws the virtual mouse arrow plus a subtle hold ring at the tip while LMB or RMB is held.
+pub fn draw_pointer_held(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    cursor: (f32, f32),
+    scale: f32,
+    held: Option<MouseButton>,
+) {
+    if let Some(button) = held {
+        let scale = if scale.is_finite() {
+            scale.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        let sw = batch.width.max(1.0);
+        let sh = batch.height.max(1.0);
+        let x = cursor.0.clamp(0.0, (sw - 3.0 * scale).max(0.0));
+        let y = cursor.1.clamp(0.0, (sh - 3.0 * scale).max(0.0));
+        let r = (4.5 * scale).clamp(3.0, 9.0);
+        let ring = match button {
+            MouseButton::Right => rgba(255, 196, 64, 220),
+            _ => rgba(96, 224, 255, 220),
+        };
+        let dark = rgba(16, 18, 24, 175);
+        let t = (1.25 * scale).clamp(1.0, 2.2);
+        // Subtle 4-bar halo around the exact click hotspot.
+        batch.fill(
+            atlas,
+            x - r - 0.5,
+            y - r - 0.5,
+            2.0 * r + 1.0,
+            t + 1.0,
+            dark,
+        );
+        batch.fill(
+            atlas,
+            x - r - 0.5,
+            y + r - t - 0.5,
+            2.0 * r + 1.0,
+            t + 1.0,
+            dark,
+        );
+        batch.fill(
+            atlas,
+            x - r - 0.5,
+            y - r - 0.5,
+            t + 1.0,
+            2.0 * r + 1.0,
+            dark,
+        );
+        batch.fill(
+            atlas,
+            x + r - t - 0.5,
+            y - r - 0.5,
+            t + 1.0,
+            2.0 * r + 1.0,
+            dark,
+        );
+        batch.fill(atlas, x - r, y - r, 2.0 * r, t, ring);
+        batch.fill(atlas, x - r, y + r - t, 2.0 * r, t, ring);
+        batch.fill(atlas, x - r, y - r, t, 2.0 * r, ring);
+        batch.fill(atlas, x + r - t, y - r, t, 2.0 * r, ring);
+    }
+    draw_pointer(batch, atlas, cursor, scale);
 }
 
 impl TouchUi {
@@ -679,8 +772,7 @@ impl TouchUi {
     pub fn cancel(&mut self) {
         self.gesture = None;
         self.pointer_drag = None;
-        self.relative = None;
-        self.relative_click = None;
+        self.cancel_relative();
         self.slider_gesture = None;
         self.sensitivity_dragging = false;
         self.pointer_size_dragging = false;
@@ -690,8 +782,17 @@ impl TouchUi {
         self.hub_scroll_drag = None;
     }
     pub fn cancel_relative(&mut self) {
-        self.relative = None;
-        self.relative_click = None;
+        self.relative_events
+            .retain(|e| matches!(e, VirtualMouseEvent::Release(_)));
+        if let Some(touch) = self.relative.take()
+            && let Some(held) = touch.held_button
+        {
+            self.relative_events.push(VirtualMouseEvent::Release(held));
+        }
+    }
+    /// The mouse button currently held via hold-to-drag on the virtual mouse, if any.
+    pub fn virtual_mouse_held_button(&self) -> Option<MouseButton> {
+        self.relative.as_ref().and_then(|t| t.held_button)
     }
     pub fn owns_relative(&self, id: u64) -> bool {
         self.relative
@@ -704,11 +805,14 @@ impl TouchUi {
             .is_some_and(|(owner, _, _, _)| *owner == id)
             || self.pointer_drag == Some(id)
     }
-    /// Relative trackpad motion with touch-anywhere clicks:
-    /// - 1-finger drag moves the virtual cursor smoothly (no teleport on touch-down).
-    /// - 1-finger tap anywhere triggers Left Click (`Some(false)`).
-    /// - 2-finger tap anywhere (either simultaneous 2-finger tap, or tapping a 2nd finger
-    ///   while resting/aiming with the 1st) triggers Right Click (`Some(true)`).
+    /// Full trackpad virtual mouse:
+    /// - 1-finger drag moves cursor smoothly (no teleport on touch-down).
+    /// - 1-finger tap -> Left Click.
+    /// - 1-finger stationary hold (350 ms) -> Hold Left Click (drag scrollbars, sliders, skin, map, inventory).
+    /// - 2-finger tap -> Right Click.
+    /// - 2-finger vertical drag -> Mouse Wheel scroll.
+    /// - 2-finger stationary hold (350 ms) -> Hold Right Click (crafting/inventory RMB drag).
+    /// - 3-finger tap -> Middle Click (clone/pick stack).
     pub fn relative_touch(
         &mut self,
         id: u64,
@@ -743,9 +847,18 @@ impl TouchUi {
                             last: point,
                             dragged: false,
                         });
-                        if touch.fingers.len() >= 2 {
-                            touch.multi_finger = true;
-                            touch.right_sent = false;
+                        if touch.held_button.is_none() {
+                            let count = touch.fingers.len().min(255) as u8;
+                            if count > touch.max_fingers {
+                                touch.max_fingers = count;
+                            }
+                            if count >= 2 {
+                                touch.since = Instant::now();
+                                touch.multi_fired = false;
+                                let avg_y = touch.fingers.iter().map(|f| f.last[1]).sum::<f32>()
+                                    / touch.fingers.len() as f32;
+                                touch.scroll_last_y = avg_y;
+                            }
                         }
                     }
                     return touch.cursor;
@@ -758,8 +871,12 @@ impl TouchUi {
                         dragged: false,
                     }],
                     cursor,
-                    multi_finger: false,
-                    right_sent: false,
+                    max_fingers: 1,
+                    since: Instant::now(),
+                    held_button: None,
+                    scrolling: false,
+                    scroll_last_y: point[1],
+                    multi_fired: false,
                     clicks_allowed: clicks,
                 });
                 cursor
@@ -774,7 +891,27 @@ impl TouchUi {
                     touch.cursor = cursor;
                 }
                 let finger_count = touch.fingers.len();
-                let slop = if touch.multi_finger { 10.0 } else { 6.0 };
+                let primary_id = touch.fingers.first().map(|f| f.id);
+                if touch.held_button.is_some() {
+                    if let Some(finger) = touch.fingers.iter_mut().find(|f| f.id == id) {
+                        if primary_id == Some(id) {
+                            let position = [0, 1].map(|i| {
+                                let max_bound = (size[i] - 1.0).max(0.0);
+                                (touch.cursor[i] + (point[i] - finger.last[i]) * sens)
+                                    .clamp(0.0, max_bound)
+                            });
+                            touch.cursor = position;
+                        }
+                        finger.dragged = true;
+                        finger.last = point;
+                    }
+                    return touch.cursor;
+                }
+                let slop = match touch.max_fingers {
+                    1 => 6.0,
+                    2 => 10.0,
+                    _ => 12.0,
+                };
                 if let Some(finger) = touch.fingers.iter_mut().find(|f| f.id == id) {
                     finger.dragged |=
                         (point[0] - finger.origin[0]).hypot(point[1] - finger.origin[1]) > slop;
@@ -788,6 +925,25 @@ impl TouchUi {
                     }
                     finger.last = point;
                 }
+                // 2-finger vertical drag drives the mouse wheel (only when both fingers started
+                // together rather than aim-with-1 + tap-with-2nd).
+                if finger_count == 2 && touch.max_fingers == 2 {
+                    let avg_y = (touch.fingers[0].last[1] + touch.fingers[1].last[1]) * 0.5;
+                    if !touch.scrolling
+                        && (touch.fingers.iter().all(|f| f.dragged)
+                            || (avg_y - touch.scroll_last_y).abs() > 10.0)
+                    {
+                        touch.scrolling = true;
+                    }
+                    if touch.scrolling {
+                        let dy = avg_y - touch.scroll_last_y;
+                        touch.scroll_last_y = avg_y;
+                        if dy.abs() > 0.01 {
+                            self.relative_events
+                                .push(VirtualMouseEvent::Scroll(dy / 18.0));
+                        }
+                    }
+                }
                 touch.cursor
             }
             TouchPhase::Ended => {
@@ -796,14 +952,29 @@ impl TouchUi {
                 };
                 if let Some(idx) = touch.fingers.iter().position(|f| f.id == id) {
                     let finger = touch.fingers.remove(idx);
-                    let allow = clicks && touch.clicks_allowed;
-                    if touch.multi_finger {
-                        if allow && !finger.dragged && !touch.right_sent {
-                            touch.right_sent = true;
-                            self.relative_click = Some(true);
+                    if let Some(held) = touch.held_button {
+                        if touch.fingers.is_empty() {
+                            self.relative_events.push(VirtualMouseEvent::Release(held));
+                            touch.held_button = None;
                         }
-                    } else if allow && !finger.dragged && !touch.right_sent {
-                        self.relative_click = Some(false);
+                    } else if !touch.scrolling {
+                        let allow = clicks && touch.clicks_allowed;
+                        if touch.max_fingers >= 3 {
+                            if allow && !finger.dragged && !touch.multi_fired {
+                                touch.multi_fired = true;
+                                self.relative_events
+                                    .push(VirtualMouseEvent::Click(MouseButton::Middle));
+                            }
+                        } else if touch.max_fingers == 2 {
+                            if allow && !finger.dragged && !touch.multi_fired {
+                                touch.multi_fired = true;
+                                self.relative_events
+                                    .push(VirtualMouseEvent::Click(MouseButton::Right));
+                            }
+                        } else if allow && !finger.dragged && !touch.multi_fired {
+                            self.relative_events
+                                .push(VirtualMouseEvent::Click(MouseButton::Left));
+                        }
                     }
                 }
                 let out = touch.cursor;
@@ -815,13 +986,36 @@ impl TouchUi {
             TouchPhase::Cancelled => cursor,
         }
     }
-    /// false = LMB (1-finger tap), true = RMB (2-finger tap).
-    pub fn relative_click(&mut self, clicks: bool) -> Option<bool> {
-        if !clicks {
-            self.relative_click = None;
-            return None;
+    /// Checks hold timers and drains queued virtual mouse events (`Press`, `Release`, `Click`,
+    /// `Scroll`). Always delivers pending `Release` events even when `clicks == false` so no
+    /// held button can ever remain stuck down.
+    pub fn take_virtual_mouse_events(&mut self, clicks: bool) -> Vec<VirtualMouseEvent> {
+        if clicks
+            && let Some(touch) = self.relative.as_mut()
+            && touch.clicks_allowed
+            && touch.held_button.is_none()
+            && !touch.scrolling
+            && !touch.multi_fired
+            && touch.since.elapsed() >= VIRTUAL_MOUSE_HOLD_DELAY
+        {
+            if touch.fingers.len() == 1 && touch.max_fingers == 1 && !touch.fingers[0].dragged {
+                touch.held_button = Some(MouseButton::Left);
+                self.relative_events
+                    .push(VirtualMouseEvent::Press(MouseButton::Left));
+            } else if touch.fingers.len() == 2
+                && touch.max_fingers == 2
+                && touch.fingers.iter().all(|f| !f.dragged)
+            {
+                touch.held_button = Some(MouseButton::Right);
+                self.relative_events
+                    .push(VirtualMouseEvent::Press(MouseButton::Right));
+            }
         }
-        self.relative_click.take()
+        let mut events = std::mem::take(&mut self.relative_events);
+        if !clicks {
+            events.retain(|e| matches!(e, VirtualMouseEvent::Release(_)));
+        }
+        events
     }
     /// Sliders retain mouse dragging; list rows use scroll-or-tap gestures.
     pub fn direct_pointer(&mut self, id: u64, p: [f32; 2], phase: TouchPhase, track: bool) -> bool {
@@ -8240,9 +8434,9 @@ mod tests {
             true,
         );
         ui.press_mouse(2, false);
-        assert_eq!(ui.relative_click(false), None);
+        assert!(ui.take_virtual_mouse_events(false).is_empty());
         assert_eq!(ui.release_mouse(2), Some((false, true)));
-        assert_eq!(ui.relative_click(true), None);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
         ui.relative_touch(
             1,
             [10.0, 10.0],
@@ -8252,7 +8446,7 @@ mod tests {
             1.0,
             true,
         );
-        assert_eq!(ui.relative_click(true), None);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
     }
     #[test]
     fn authoritative_virtual_mouse_visibility_and_viewport_centering() {
@@ -8403,28 +8597,118 @@ mod tests {
         );
         assert_eq!(p, [120.0, 70.0]);
         ui.relative_touch(1, [310.0, 195.0], TouchPhase::Ended, p, size, 2.0, true);
-        assert_eq!(ui.relative_click(true), None);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
     }
     #[test]
-    fn virtual_mouse_one_finger_left_and_two_finger_right_click() {
+    fn virtual_mouse_full_gestures_clicks_holds_scroll_and_cancel() {
         let mut ui = TouchUi::default();
         let p = [100.0, 80.0];
         let p2 = [140.0, 80.0];
+        let p3 = [180.0, 80.0];
         let size = [400.0, 240.0];
-        // 1-finger tap anywhere -> Left Click.
+
+        // 1-finger tap -> Left Click.
         ui.relative_touch(1, p, TouchPhase::Started, p, size, 1.0, true);
         ui.relative_touch(1, p, TouchPhase::Ended, p, size, 1.0, true);
-        assert_eq!(ui.relative_click(true), Some(false));
-        assert_eq!(ui.relative_click(true), None);
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Click(MouseButton::Left)]
+        );
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
 
-        // 2-finger tap anywhere -> Right Click (fires once, never also Left Click).
+        // 2-finger tap -> Right Click (once, never also Left Click).
         ui.relative_touch(10, p, TouchPhase::Started, p, size, 1.0, true);
         ui.relative_touch(11, p2, TouchPhase::Started, p, size, 1.0, true);
         assert!(ui.owns_relative(10) && ui.owns_relative(11));
         ui.relative_touch(11, p2, TouchPhase::Ended, p, size, 1.0, true);
-        assert_eq!(ui.relative_click(true), Some(true));
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Click(MouseButton::Right)]
+        );
         ui.relative_touch(10, p, TouchPhase::Ended, p, size, 1.0, true);
-        assert_eq!(ui.relative_click(true), None);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
+
+        // 3-finger tap -> Middle Click (once, never also Right or Left Click).
+        ui.relative_touch(30, p, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative_touch(31, p2, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative_touch(32, p3, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative_touch(32, p3, TouchPhase::Ended, p, size, 1.0, true);
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Click(MouseButton::Middle)]
+        );
+        ui.relative_touch(31, p2, TouchPhase::Ended, p, size, 1.0, true);
+        ui.relative_touch(30, p, TouchPhase::Ended, p, size, 1.0, true);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
+
+        // 1-finger hold (>= 350 ms) -> Press(Left), drag moves cursor while held, lift -> Release(Left).
+        ui.relative_touch(40, p, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative.as_mut().unwrap().since =
+            Instant::now() - VIRTUAL_MOUSE_HOLD_DELAY - Duration::from_millis(20);
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Press(MouseButton::Left)]
+        );
+        assert_eq!(ui.virtual_mouse_held_button(), Some(MouseButton::Left));
+        let dragged = ui.relative_touch(40, [130.0, 110.0], TouchPhase::Moved, p, size, 1.0, true);
+        assert_eq!(dragged, [130.0, 110.0]);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
+        ui.relative_touch(
+            40,
+            [130.0, 110.0],
+            TouchPhase::Ended,
+            dragged,
+            size,
+            1.0,
+            true,
+        );
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Release(MouseButton::Left)]
+        );
+        assert_eq!(ui.virtual_mouse_held_button(), None);
+
+        // 2-finger hold (>= 350 ms) -> Press(Right), drag while held, lift all -> Release(Right).
+        ui.relative_touch(50, p, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative_touch(51, p2, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative.as_mut().unwrap().since =
+            Instant::now() - VIRTUAL_MOUSE_HOLD_DELAY - Duration::from_millis(20);
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Press(MouseButton::Right)]
+        );
+        assert_eq!(ui.virtual_mouse_held_button(), Some(MouseButton::Right));
+        let dragged = ui.relative_touch(50, [120.0, 90.0], TouchPhase::Moved, p, size, 1.0, true);
+        assert_eq!(dragged, [120.0, 90.0]);
+        ui.relative_touch(51, p2, TouchPhase::Ended, dragged, size, 1.0, true);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
+        ui.relative_touch(
+            50,
+            [120.0, 90.0],
+            TouchPhase::Ended,
+            dragged,
+            size,
+            1.0,
+            true,
+        );
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Release(MouseButton::Right)]
+        );
+
+        // 2-finger vertical drag -> Scroll events, no stray Right Click on release.
+        ui.relative_touch(60, [100.0, 80.0], TouchPhase::Started, p, size, 1.0, true);
+        ui.relative_touch(61, [140.0, 80.0], TouchPhase::Started, p, size, 1.0, true);
+        ui.relative_touch(60, [100.0, 116.0], TouchPhase::Moved, p, size, 1.0, true);
+        ui.relative_touch(61, [140.0, 116.0], TouchPhase::Moved, p, size, 1.0, true);
+        let evs = ui.take_virtual_mouse_events(true);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, VirtualMouseEvent::Scroll(dy) if *dy > 0.5))
+        );
+        ui.relative_touch(60, [100.0, 116.0], TouchPhase::Ended, p, size, 1.0, true);
+        ui.relative_touch(61, [140.0, 116.0], TouchPhase::Ended, p, size, 1.0, true);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
 
         // Aim with finger 1 (dragged), tap finger 2 -> Right Click, lifting finger 1 does nothing.
         ui.relative_touch(20, p, TouchPhase::Started, p, size, 1.0, true);
@@ -8432,18 +8716,26 @@ mod tests {
         assert_eq!(moved, [130.0, 80.0]);
         ui.relative_touch(21, p2, TouchPhase::Started, moved, size, 1.0, true);
         ui.relative_touch(21, p2, TouchPhase::Ended, moved, size, 1.0, true);
-        assert_eq!(ui.relative_click(true), Some(true));
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Click(MouseButton::Right)]
+        );
         ui.relative_touch(20, [130.0, 80.0], TouchPhase::Ended, moved, size, 1.0, true);
-        assert_eq!(ui.relative_click(true), None);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
 
-        // Clicks disabled and cancel clear state cleanly.
-        ui.relative_touch(3, p, TouchPhase::Started, p, size, 1.0, false);
-        ui.relative_touch(3, p, TouchPhase::Ended, p, size, 1.0, false);
-        assert_eq!(ui.relative_click(false), None);
-        ui.relative_touch(4, p, TouchPhase::Started, p, size, 1.0, true);
+        // Cancelling while LMB is held emits Release(Left) even if clicks=false.
+        ui.relative_touch(70, p, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative.as_mut().unwrap().since =
+            Instant::now() - VIRTUAL_MOUSE_HOLD_DELAY - Duration::from_millis(20);
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Press(MouseButton::Left)]
+        );
         ui.cancel_relative();
-        ui.relative_touch(4, p, TouchPhase::Ended, p, size, 1.0, true);
-        assert_eq!(ui.relative_click(true), None);
+        assert_eq!(
+            ui.take_virtual_mouse_events(false),
+            vec![VirtualMouseEvent::Release(MouseButton::Left)]
+        );
     }
     #[test]
     fn simultaneous_f3_f4_and_f6_release_independently() {
