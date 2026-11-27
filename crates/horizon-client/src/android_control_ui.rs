@@ -909,17 +909,22 @@ impl TouchUi {
                     touch.cursor = cursor;
                 }
                 let finger_count = touch.fingers.len();
-                let primary_id = touch.fingers.first().map(|f| f.id);
                 if touch.held_button.is_some() {
                     if let Some(finger) = touch.fingers.iter_mut().find(|f| f.id == id) {
-                        if primary_id == Some(id) {
-                            let position = [0, 1].map(|i| {
-                                let max_bound = (size[i] - 1.0).max(0.0);
-                                (touch.cursor[i] + (point[i] - finger.last[i]) * sens)
-                                    .clamp(0.0, max_bound)
-                            });
-                            touch.cursor = position;
-                        }
+                        // When holding with 2 fingers (e.g. RMB crafting drag), either finger
+                        // moving drives the cursor smoothly; lifting one finger hands full 1x
+                        // control to the remaining finger without releasing the hold.
+                        let scale = if finger_count <= 1 {
+                            sens
+                        } else {
+                            sens / finger_count as f32
+                        };
+                        let position = [0, 1].map(|i| {
+                            let max_bound = (size[i] - 1.0).max(0.0);
+                            (touch.cursor[i] + (point[i] - finger.last[i]) * scale)
+                                .clamp(0.0, max_bound)
+                        });
+                        touch.cursor = position;
                         finger.dragged = true;
                         finger.last = point;
                     }
@@ -8704,7 +8709,8 @@ mod tests {
         );
         assert_eq!(ui.virtual_mouse_held_button(), None);
 
-        // 2-finger hold (>= 350 ms) -> Press(Right), drag while held, lift all -> Release(Right).
+        // 2-finger hold (>= 350 ms) -> Press(Right); lifting either finger keeps RMB held and
+        // lets the remaining finger move the cursor comfortably until the last finger lifts.
         ui.relative_touch(50, p, TouchPhase::Started, p, size, 1.0, true);
         ui.relative_touch(51, p2, TouchPhase::Started, p, size, 1.0, true);
         ui.relative.as_mut().unwrap().since =
@@ -8714,12 +8720,42 @@ mod tests {
             vec![VirtualMouseEvent::Press(MouseButton::Right)]
         );
         assert_eq!(ui.virtual_mouse_held_button(), Some(MouseButton::Right));
-        let dragged = ui.relative_touch(50, [120.0, 90.0], TouchPhase::Moved, p, size, 1.0, true);
-        assert_eq!(dragged, [120.0, 90.0]);
-        ui.relative_touch(51, p2, TouchPhase::Ended, dragged, size, 1.0, true);
+        // Lift the first-down finger (50): hold stays active and remaining finger (51) moves cursor.
+        ui.relative_touch(50, p, TouchPhase::Ended, p, size, 1.0, true);
         assert!(ui.take_virtual_mouse_events(true).is_empty());
+        assert_eq!(ui.virtual_mouse_held_button(), Some(MouseButton::Right));
+        let dragged = ui.relative_touch(51, [160.0, 95.0], TouchPhase::Moved, p, size, 1.0, true);
+        assert_eq!(dragged, [120.0, 95.0]);
         ui.relative_touch(
-            50,
+            51,
+            [160.0, 95.0],
+            TouchPhase::Ended,
+            dragged,
+            size,
+            1.0,
+            true,
+        );
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Release(MouseButton::Right)]
+        );
+        assert_eq!(ui.virtual_mouse_held_button(), None);
+
+        // Same 2-finger hold, lifting the second-down finger (53) instead: finger 52 moves cursor.
+        ui.relative_touch(52, p, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative_touch(53, p2, TouchPhase::Started, p, size, 1.0, true);
+        ui.relative.as_mut().unwrap().since =
+            Instant::now() - VIRTUAL_MOUSE_HOLD_DELAY - Duration::from_millis(20);
+        assert_eq!(
+            ui.take_virtual_mouse_events(true),
+            vec![VirtualMouseEvent::Press(MouseButton::Right)]
+        );
+        ui.relative_touch(53, p2, TouchPhase::Ended, p, size, 1.0, true);
+        assert!(ui.take_virtual_mouse_events(true).is_empty());
+        let dragged = ui.relative_touch(52, [120.0, 90.0], TouchPhase::Moved, p, size, 1.0, true);
+        assert_eq!(dragged, [120.0, 90.0]);
+        ui.relative_touch(
+            52,
             [120.0, 90.0],
             TouchPhase::Ended,
             dragged,

@@ -30,6 +30,8 @@ pub(super) struct MobileControls {
     hardware_keys: std::collections::HashSet<KeyCode>,
     pub touch_shield: bool,
     pub touch_aim: Option<[f32; 2]>,
+    /// Slot picked up by a 1-finger virtual-mouse hold so releasing over another slot drops it there.
+    vm_drag_pickup_slot: Option<usize>,
     pub loaded: bool,
     frame_at: Option<Instant>,
     was_in_menu: Option<bool>,
@@ -1438,6 +1440,7 @@ impl Game<'_> {
 
     pub(super) fn android_set_virtual_mouse(&mut self, enabled: bool) {
         if !enabled {
+            self.mobile.vm_drag_pickup_slot = None;
             self.mobile.ui.cancel_relative();
             for right in self.mobile.ui.release_all_mouse() {
                 let button = if right {
@@ -2150,6 +2153,7 @@ impl Game<'_> {
             self.creative_screen.release();
             self.loom_release();
         }
+        self.mobile.vm_drag_pickup_slot = None;
         self.mobile.ui.cancel_relative();
         for right in self.mobile.ui.release_all_mouse() {
             let button = if right {
@@ -2387,6 +2391,7 @@ impl Game<'_> {
     ) {
         use horizon_client::android_control_ui::VirtualMouseEvent;
         if !self.focused || !self.mobile.ui.virtual_mouse {
+            self.mobile.vm_drag_pickup_slot = None;
             self.mobile.ui.cancel_relative();
             for ev in self.mobile.ui.take_virtual_mouse_events(false) {
                 if let VirtualMouseEvent::Release(button) = ev {
@@ -2403,6 +2408,7 @@ impl Game<'_> {
             return;
         }
         if !self.pad_in_menu() {
+            self.mobile.vm_drag_pickup_slot = None;
             for ev in self.mobile.ui.take_virtual_mouse_events(false) {
                 if let VirtualMouseEvent::Release(button) = ev {
                     self.android_virtual_mouse_button(events, button, false);
@@ -2414,13 +2420,48 @@ impl Game<'_> {
         for ev in self.mobile.ui.take_virtual_mouse_events(allow_clicks) {
             match ev {
                 VirtualMouseEvent::Press(button) => {
+                    let empty_inv_pickup = button == MouseButton::Left
+                        && matches!(self.screen, Screen::Inventory | Screen::Creative)
+                        && self.carried.is_none()
+                        && !self.has_shift_down();
+                    let pickup_slot = if empty_inv_pickup {
+                        self.inventory_target().0
+                    } else {
+                        None
+                    };
                     self.android_virtual_mouse_button(events, button, true);
+                    self.mobile.vm_drag_pickup_slot = if empty_inv_pickup && self.carried.is_some()
+                    {
+                        pickup_slot
+                    } else {
+                        None
+                    };
                     self.android_touch_haptic(14);
                 }
                 VirtualMouseEvent::Release(button) => {
+                    let pickup_slot = self.mobile.vm_drag_pickup_slot.take();
                     self.android_virtual_mouse_button(events, button, false);
+                    // One-motion drag-and-drop: if a 1-finger hold picked up an item from an
+                    // empty hand and dragged it onto another slot, place/swap it there on lift.
+                    if button == MouseButton::Left
+                        && let Some(origin_slot) = pickup_slot
+                        && matches!(self.screen, Screen::Inventory | Screen::Creative)
+                        && self.carried.is_some()
+                        && self.inv_drag.is_none()
+                    {
+                        let (dest, outside) = self.inventory_target();
+                        if !outside
+                            && let Some(dest_slot) = dest
+                            && dest_slot != origin_slot
+                            && dest_slot != 200
+                        {
+                            self.android_virtual_mouse_button(events, MouseButton::Left, true);
+                            self.android_virtual_mouse_button(events, MouseButton::Left, false);
+                        }
+                    }
                 }
                 VirtualMouseEvent::Click(button) => {
+                    self.mobile.vm_drag_pickup_slot = None;
                     self.android_virtual_mouse_button(events, button, true);
                     self.android_virtual_mouse_button(events, button, false);
                 }
