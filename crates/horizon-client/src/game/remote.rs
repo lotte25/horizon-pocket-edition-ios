@@ -9649,7 +9649,7 @@ impl Game<'_> {
     /// runs the client half of `Item.releaseUsing` (a Riptide launch moves the
     /// player itself). Vanilla reaches it both when the use key is let go and,
     /// in the same tick, when a keybind opens a screen.
-    fn release_remote_use(&mut self) {
+    pub(super) fn release_remote_use(&mut self) {
         self.send(S::PlayerAction(play::PlayerAction {
             action: 6,
             pos: [0; 3],
