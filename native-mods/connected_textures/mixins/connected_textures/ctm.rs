@@ -264,6 +264,9 @@ pub fn blocks() -> Vec<(String, String, Option<String>, Method, u32)> {
 }
 
 static RULES: Mutex<Option<Arc<Rules>>> = Mutex::new(None);
+thread_local! {
+    static THREAD_RULES: std::cell::RefCell<Option<Arc<Rules>>> = const { std::cell::RefCell::new(None) };
+}
 
 /// The table for the resources `key` names (they change on a resource reload): `states` block
 /// states, `name` a state's block, `layer` a sprite's layer.
@@ -273,11 +276,21 @@ pub fn rules(
     name: &dyn Fn(u32) -> Option<String>,
     layer: &dyn Fn(&str) -> Option<u16>,
 ) -> Arc<Rules> {
+    if let Some(hit) = THREAD_RULES.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|r| r.key == key)
+            .cloned()
+    }) {
+        return hit;
+    }
     let mut g = RULES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(r) = g.as_ref()
         && r.key == key
     {
-        return r.clone();
+        let cloned = r.clone();
+        THREAD_RULES.with(|cell| *cell.borrow_mut() = Some(cloned.clone()));
+        return cloned;
     }
     let sprite = |n: &str| -> Option<u16> {
         layer(&format!("minecraft:block/{n}")).or_else(|| layer(&format!("block/{n}")))
@@ -319,6 +332,7 @@ pub fn rules(
     }
     let r = Arc::new(Rules { key, by_state, groups, tiles });
     *g = Some(r.clone());
+    THREAD_RULES.with(|cell| *cell.borrow_mut() = Some(r.clone()));
     r
 }
 

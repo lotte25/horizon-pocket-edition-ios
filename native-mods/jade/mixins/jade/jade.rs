@@ -729,7 +729,27 @@ pub fn on(game: &Game<'_>, key: &'static str) -> bool {
 }
 
 pub fn num(game: &Game<'_>, key: &'static str) -> f64 {
-    opt(game, key).parse().unwrap_or(0.0)
+    let epoch = SETTINGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    let quick = VALUES.with_borrow(|(at, values)| {
+        if *at == epoch {
+            values.get(key).map(|v| v.parse().unwrap_or(0.0))
+        } else {
+            None
+        }
+    });
+    quick.unwrap_or_else(|| opt(game, key).parse().unwrap_or(0.0))
+}
+
+fn opt_is(game: &Game<'_>, key: &'static str, mut check: impl FnMut(&str) -> bool) -> bool {
+    let epoch = SETTINGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    let quick = VALUES.with_borrow(|(at, values)| {
+        if *at == epoch {
+            Some(check(values.get(key).map_or("", String::as_str)))
+        } else {
+            None
+        }
+    });
+    quick.unwrap_or_else(|| check(&opt(game, key)))
 }
 
 /// What a slider or a dragged overlay says while it moves: read back by `opt` at once, with no file written and no
@@ -2725,6 +2745,18 @@ fn keys(game: &Game<'_>) -> bool {
     if crate::game::jade_config::is_open() {
         return false;
     }
+    // Fast path when no physical keyboard or mouse button is held (typical on mobile touch play):
+    // skips 7-11 native_mod_key lookups and heap allocations every frame.
+    if game.physical_keys.is_empty() && game.physical_buttons.is_empty() {
+        let toggle = config(game).toggle_mode;
+        CLIENT.with_borrow_mut(|c| {
+            if !toggle {
+                c.hidden = true;
+            }
+            c.keys_down.clear();
+        });
+        return false;
+    }
     // InputConstants.Key: a mapping is a key of the keyboard or a button of the mouse.
     let down = |name: &str| {
         let default = KEYS.iter().find(|k| k[0] == name).map_or("", |k| k[2]);
@@ -3270,10 +3302,12 @@ pub fn hud(game: &mut Game<'_>, batch: &mut HudBatch) {
         return;
     }
     // Boss Bar Overlap's Hide Tooltip, and how far Push Down moves it.
-    let overlap = opt(game, "boss_bar_overlap");
     let bars = game.boss_overlay.bars(horizon_client::boss_overlay::now_millis()).len();
-    let at_top = opt(game, "position");
-    if bars > 0 && overlap == "hide_tip" && !previewing && (at_top == "0" || at_top.starts_with("custom:")) {
+    if bars > 0
+        && !previewing
+        && opt_is(game, "boss_bar_overlap", |v| v == "hide_tip")
+        && opt_is(game, "position", |v| v == "0" || v.starts_with("custom:"))
+    {
         return;
     }
     let pinned = CLIENT.with_borrow(|c| c.pinned.clone());

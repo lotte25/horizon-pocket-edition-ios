@@ -785,11 +785,11 @@ impl TouchControls {
                 };
                 if self.settings.mode == Mode::Dpad {
                     let cell = size / 3.0;
-                    for (dx, dy, name) in [
-                        (0, -1, "up"),
-                        (-1, 0, "left"),
-                        (1, 0, "right"),
-                        (0, 1, "down"),
+                    for (dx, dy, normal, down) in [
+                        (0, -1, "controls/up", "controls/up_pressed"),
+                        (-1, 0, "controls/left", "controls/left_pressed"),
+                        (1, 0, "controls/right", "controls/right_pressed"),
+                        (0, 1, "controls/down", "controls/down_pressed"),
                     ] {
                         let pressed = match (dx, dy) {
                             (0, -1) => state.left[1] > 0.2,
@@ -800,7 +800,7 @@ impl TouchControls {
                         fitted_sprite(
                             b,
                             a,
-                            &format!("controls/{name}{}", if pressed { "_pressed" } else { "" }),
+                            if pressed { down } else { normal },
                             [
                                 x + cell * (dx + 1) as f32,
                                 y + cell * (dy + 1) as f32,
@@ -812,12 +812,20 @@ impl TouchControls {
                     }
                     // Vanilla shows the diagonal keys while their adjoining arrow is held.
                     if state.left[1].abs() > 0.2 {
-                        let (dy, prefix) = if state.left[1] > 0.0 {
-                            (0, "up")
+                        let (dy, left_pair, right_pair) = if state.left[1] > 0.0 {
+                            (
+                                0,
+                                ("controls/up_left", "controls/up_left_pressed"),
+                                ("controls/up_right", "controls/up_right_pressed"),
+                            )
                         } else {
-                            (2, "down")
+                            (
+                                2,
+                                ("controls/down_left", "controls/down_left_pressed"),
+                                ("controls/down_right", "controls/down_right_pressed"),
+                            )
                         };
-                        for (dx, suffix) in [(0, "left"), (2, "right")] {
+                        for (dx, (normal, down)) in [(0, left_pair), (2, right_pair)] {
                             let pressed = if dx == 0 {
                                 state.left[0] < -0.2
                             } else {
@@ -826,10 +834,7 @@ impl TouchControls {
                             sprite(
                                 b,
                                 a,
-                                &format!(
-                                    "controls/{prefix}_{suffix}{}",
-                                    if pressed { "_pressed" } else { "" }
-                                ),
+                                if pressed { down } else { normal },
                                 [x + cell * dx as f32, y + cell * dy as f32, cell, cell],
                                 color,
                             );
@@ -2398,21 +2403,22 @@ fn starling_utility(
     pressed: bool,
     opacity: f32,
 ) -> bool {
-    let name = match c {
-        Control::Pause => "pause",
-        Control::Inventory => "inventory",
-        Control::Settings => "settings",
+    let key = match (c, pressed) {
+        (Control::Pause, false) => "starling:android-controls/pause",
+        (Control::Pause, true) => "starling:android-controls/pause_pressed",
+        (Control::Inventory, false) => "starling:android-controls/inventory",
+        (Control::Inventory, true) => "starling:android-controls/inventory_pressed",
+        (Control::Settings, false) => "starling:android-controls/settings",
+        (Control::Settings, true) => "starling:android-controls/settings_pressed",
         _ => return false,
     };
-    let suffix = if pressed { "_pressed" } else { "" };
-    let key = format!("starling:android-controls/{name}{suffix}");
-    if !a.sprites.contains_key(&key) {
+    if !a.sprites.contains_key(key) {
         return false;
     }
     crate::ui::sprite_sized(
         b,
         a,
-        &key,
+        key,
         rect[0],
         rect[1],
         rect[2],

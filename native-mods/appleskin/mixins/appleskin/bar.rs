@@ -57,9 +57,20 @@ fn anchors(batch: &HudBatch) -> (f32, f32, f32) {
     )
 }
 
+thread_local! {
+    static APPLESKIN_OPTIONS: std::cell::Cell<Option<aps::Options>> = const { std::cell::Cell::new(None) };
+}
+
 impl Game<'_> {
     fn appleskin_options(&self) -> aps::Options {
-        aps::Options::from_settings(|key| self.native_setting(aps::ID, key))
+        APPLESKIN_OPTIONS.with(|cell| {
+            if let Some(opts) = cell.get() {
+                return opts;
+            }
+            let opts = aps::Options::from_settings(|key| self.native_setting(aps::ID, key));
+            cell.set(Some(opts));
+            opts
+        })
     }
 
     fn appleskin_sprite(&self, batch: &mut HudBatch, x: f32, y: f32, grid: &[&str], half: bool, look: (f32, f32)) {
@@ -201,6 +212,7 @@ impl Game<'_> {
         let options = self.appleskin_options();
         if button == 3 {
             self.native_set_setting(aps::ID, aps::KEYS[3], options.animation.next().code());
+            APPLESKIN_OPTIONS.with(|cell| cell.set(None));
             return;
         }
         let Some(key) = aps::KEYS.get(button) else {
@@ -208,5 +220,6 @@ impl Game<'_> {
         };
         let on = options.get(button);
         self.native_set_setting(aps::ID, key, aps::flag_text(!on));
+        APPLESKIN_OPTIONS.with(|cell| cell.set(None));
     }
 }

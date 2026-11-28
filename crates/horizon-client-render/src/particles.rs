@@ -4233,6 +4233,25 @@ impl ParticleEngine {
         light_at: &dyn Fn([i32; 3]) -> u8,
         out: &mut Vec<Vertex>,
     ) {
+        self.render_in_view(camera, yaw, pitch, partial, None, light_at, out);
+    }
+
+    /// [`Self::render`], keeping only particles inside `view` pulled back 3 blocks
+    /// (vanilla's `ParticleEngine.extract` + `QuadParticleGroup`). With `None`, every
+    /// particle is drawn.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_in_view(
+        &self,
+        camera: DVec3,
+        yaw: f32,
+        pitch: f32,
+        partial: f32,
+        view: Option<&crate::gfx::Frustum>,
+        light_at: &dyn Fn([i32; 3]) -> u8,
+        out: &mut Vec<Vertex>,
+    ) {
+        const PARTICLE_FRUSTUM_OFFSET: f32 = 3.0;
+        let view = view.map(|f| f.pulled_back(PARTICLE_FRUSTUM_OFFSET));
         // Camera.setRotation: rotationYXZ(PI - yRot, -xRot, 0).
         let base = Quat::from_rotation_y(std::f32::consts::PI - yaw.to_radians())
             * Quat::from_rotation_x(-pitch.to_radians());
@@ -4240,6 +4259,12 @@ impl ParticleEngine {
         for p in &self.particles {
             if p.no_render {
                 continue;
+            }
+            if let Some(view) = &view {
+                let at = DVec3::from_array(p.position) - camera;
+                if !view.contains_point(at.as_vec3()) {
+                    continue;
+                }
             }
             // SparkParticle.extract: twinkling sparks blink after a third of their life.
             if let Behaviour::Spark { twinkle: true, .. } = p.behaviour

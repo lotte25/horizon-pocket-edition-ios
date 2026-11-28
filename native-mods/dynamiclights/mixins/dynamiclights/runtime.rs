@@ -206,7 +206,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            enabled: true,
+            enabled: !cfg!(target_os = "ios"),
             kinds: [true; 8],
             water: true,
             brightness: 100,

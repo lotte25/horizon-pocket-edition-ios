@@ -640,6 +640,15 @@ impl Inner {
         self.view.setContentScaleFactor(scale_factor);
     }
 
+    pub fn set_preferred_frame_rate(&self, frames_per_second: Option<u32>) {
+        let maximum = if app_state::os_capabilities().maximum_frames_per_second {
+            self.window.screen().maximumFramesPerSecond().max(1) as u32
+        } else {
+            60
+        };
+        super::display_link::request(MainThreadMarker::new().unwrap(), frames_per_second, maximum);
+    }
+
     pub fn set_valid_orientations(&self, valid_orientations: ValidOrientations) {
         self.view_controller.set_supported_interface_orientations(
             MainThreadMarker::new().unwrap(),

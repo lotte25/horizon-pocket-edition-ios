@@ -156,9 +156,9 @@ impl Default for Extras {
     fn default() -> Self {
         Self {
             fullbright: false,
-            // Horizon PE: Shared Worlds + Mods has dynamic lights, the Mouse Tweaks controls and
-            // the sort buttons on from the first start.
-            dynamic_lights: true,
+            // Horizon PE: Shared Worlds + Mods has the Mouse Tweaks controls and sort buttons on
+            // from the first start; iOS defaults Dynamic Lights off for GPU/CPU headroom (opt-in).
+            dynamic_lights: !cfg!(target_os = "ios"),
             zoom: false,
             zoom_key: "key.keyboard.z".into(),
             zoom_level: 4,

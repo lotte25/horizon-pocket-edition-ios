@@ -775,14 +775,25 @@ impl Game<'_> {
         true
     }
 
+    #[cfg(target_os = "ios")]
+    pub(super) fn publish_frame_rate(&self, limit: i32) {
+        if let Some(window) = &self.window {
+            use winit::platform::ios::WindowExtIOS;
+            window.set_preferred_frame_rate(Some(limit.max(1) as u32));
+        }
+    }
+
     pub(super) fn limit_frame(&mut self) {
         if self.options.frames.is_some() || self.options.paced_by_split {
             return;
         }
         let limit = self.framerate_limit();
         #[cfg(target_os = "ios")]
-        if self.display_paced(limit) {
-            return;
+        {
+            self.publish_frame_rate(limit);
+            if self.display_paced(limit) {
+                return;
+            }
         }
         match self.settings.horizon.pacing {
             horizon_client::graphics::Pacing::Precise => {

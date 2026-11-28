@@ -55,11 +55,27 @@ const SCAN_BUDGET: Duration = Duration::from_micros(800);
 /// The same while the map is open: the player is looking at it, so it may take more.
 const SCAN_BUDGET_OPEN: Duration = Duration::from_micros(3000);
 /// And while the minimap is cut at the player's height, which changes with every jump.
-const SCAN_BUDGET_LIVE: Duration = Duration::from_micros(2500);
+/// Tighter on mobile (iOS/Android) so cave-scanning never stalls a 60/120 Hz frame.
+const SCAN_BUDGET_LIVE: Duration = if cfg!(any(target_os = "ios", target_os = "android")) {
+    Duration::from_micros(700)
+} else {
+    Duration::from_micros(2500)
+};
 /// A region is written this often while some are waiting (a thread writes it), the rest at the
 /// next time, so exploring fast does not write everything at once.
 /// CPU time the files of a map may take in a frame.
-const LOAD_BUDGET: Duration = Duration::from_millis(3);
+const LOAD_BUDGET: Duration = if cfg!(any(target_os = "ios", target_os = "android")) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_millis(3)
+};
+/// Throttle minimap CPU rasterization and GPU upload to ~15 Hz on mobile; the HUD still draws
+/// the cached minimap texture every frame at the full game frame rate.
+const MINI_COMPOSE_INTERVAL: Duration = if cfg!(any(target_os = "ios", target_os = "android")) {
+    Duration::from_millis(66)
+} else {
+    Duration::ZERO
+};
 const SAVE_EVERY: Duration = Duration::from_secs(2);
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 64.0;
@@ -325,6 +341,9 @@ struct State {
     /// Where the minimap is centred and which way it faces: the camera between ticks, so it
     /// moves smoothly (x, z, yaw).
     mini_at: (f64, f64, f32),
+    /// Pose and timestamp of the last uploaded minimap rasterization (for 15 Hz throttling).
+    mini_composed_at: (f64, f64, f32),
+    mini_last_compose: Option<Instant>,
     trail: Vec<(f64, f64)>,
     /// A waypoint's name being typed, and where it goes (`editing`: the waypoint
     /// being renamed, else a new one).
@@ -439,6 +458,8 @@ impl State {
             slot: 0,
             mini_zoom: 2,
             mini_at: (0.0, 0.0, 0.0),
+            mini_composed_at: (0.0, 0.0, 0.0),
+            mini_last_compose: None,
             live_anchor: f64::NAN,
             trail: Vec::new(),
             entering: None,
@@ -976,6 +997,14 @@ impl State {
         let size = self.mini_size() as usize;
         if self.slot != 2 {
             self.map.invalidate();
+            self.mini_last_compose = None;
+        }
+        if !MINI_COMPOSE_INTERVAL.is_zero()
+            && self
+                .mini_last_compose
+                .is_some_and(|t| t.elapsed() < MINI_COMPOSE_INTERVAL)
+        {
+            return None;
         }
         let (px, pz, yaw) = self.mini_at;
         // Underground it is the floor at the player's height, else the surface.
@@ -989,6 +1018,8 @@ impl State {
         let turned = self.settings.rotate.then_some(yaw);
         if self.map.compose(layer, px, pz, bpp, size, size, light, turned) {
             self.slot = 2;
+            self.mini_composed_at = (px, pz, yaw);
+            self.mini_last_compose = Some(Instant::now());
             Some((size, self.map.image.clone()))
         } else {
             None
@@ -1011,7 +1042,11 @@ impl State {
         let _ = game.native_sprite(batch, MOD_IMAGE_SPRITE, [0.0, 0.0, size, size], [x, y, size, size]);
         let bpp = MINI_ZOOMS[self.mini_zoom.min(MINI_ZOOMS.len() - 1)];
         let py = self.player.1;
-        let (px, pz, yaw) = self.mini_at;
+        let (px, pz, yaw) = if MINI_COMPOSE_INTERVAL.is_zero() {
+            self.mini_at
+        } else {
+            self.mini_composed_at
+        };
         let half = size / 2.0;
         let centre = (x + half, y + half);
         // Forward on the map: where the player faces when it turns, else north.

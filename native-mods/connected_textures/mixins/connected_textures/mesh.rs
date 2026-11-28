@@ -46,10 +46,14 @@ fn connected_textures_mesh(
             .map(|v| ct::V { pos: v.pos, uv: v.uv, layer: v.layer, light: v.light, color: v.color })
             .collect();
         if let Some(new) = ct::process(&rules, &src, &at) {
-            *list = new
-                .into_iter()
-                .map(|v| TerrainVertex { pos: v.pos, uv: v.uv, layer: v.layer, light: v.light, color: v.color })
-                .collect();
+            list.clear();
+            list.extend(new.into_iter().map(|v| TerrainVertex {
+                pos: v.pos,
+                uv: v.uv,
+                layer: v.layer,
+                light: v.light,
+                color: v.color,
+            }));
         }
     }
     ::core::ops::ControlFlow::Break(done)

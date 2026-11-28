@@ -2088,16 +2088,18 @@ fn draw_circle_ring(
     color: u32,
 ) {
     const SEGMENTS: usize = 36;
+    static UNIT: std::sync::OnceLock<[(f32, f32); SEGMENTS + 1]> = std::sync::OnceLock::new();
     if outer_r <= inner_r || outer_r <= 0.0 {
         return;
     }
+    let unit = UNIT.get_or_init(|| {
+        let step = std::f32::consts::TAU / SEGMENTS as f32;
+        std::array::from_fn(|i| (i as f32 * step).sin_cos())
+    });
     let ir = inner_r.max(0.0);
-    let step = std::f32::consts::TAU / SEGMENTS as f32;
     for i in 0..SEGMENTS {
-        let a0 = i as f32 * step;
-        let a1 = (i + 1) as f32 * step;
-        let (s0, c0) = a0.sin_cos();
-        let (s1, c1) = a1.sin_cos();
+        let (s0, c0) = unit[i];
+        let (s1, c1) = unit[i + 1];
         let corners = [
             [center.0 + c0 * ir, center.1 + s0 * ir],
             [center.0 + c0 * outer_r, center.1 + s0 * outer_r],

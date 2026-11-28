@@ -311,8 +311,9 @@ impl Game<'_> {
         }
         let shown = self.touch_shown() || self.settings.keypad.enabled;
         if self.classic_pe_active() {
-            let item_use = self.mobile_hold_uses_item();
-            let entity_use = self.touch_entity_accepts_use();
+            let active_world = !in_menu && self.focused;
+            let item_use = active_world && self.mobile_hold_uses_item();
+            let entity_use = active_world && self.touch_entity_accepts_use();
             let shield_available = self
                 .held()
                 .into_iter()
@@ -401,10 +402,13 @@ impl Game<'_> {
             self.touch_gyro();
             return;
         }
-        let context_use = self.touch_context_use();
-        let rocket_boost = self.mobile_rocket_boost();
-        let item_use = self.mobile_hold_uses_item();
-        let entity_use = self.touch_entity_accepts_use();
+        let active_world = !in_menu && self.focused;
+        let entity_use = active_world && self.touch_entity_accepts_use();
+        let context_use = active_world
+            && self.mobile.controls.settings.contextual_interact
+            && self.touch_context_use_with_entity(entity_use);
+        let rocket_boost = active_world && self.mobile_rocket_boost();
+        let item_use = active_world && self.mobile_hold_uses_item();
         let shield_available = self
             .held()
             .into_iter()
@@ -2556,17 +2560,10 @@ impl Game<'_> {
             })
     }
     pub(super) fn touch_context_use(&self) -> bool {
-        if self.touch_entity_accepts_use()
-            || [
-                self.boat_hit().map(|h| h.1),
-                self.cart_hit().map(|h| h.1),
-                self.armor_stand_hit().map(|h| h.1),
-                self.frame_hit().map(|h| h.1),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|d| self.before_block(d))
-        {
+        self.touch_context_use_with_entity(self.touch_entity_accepts_use())
+    }
+    fn touch_context_use_with_entity(&self, entity_use: bool) -> bool {
+        if entity_use {
             return true;
         }
         let Some(hit) = self.pick() else {

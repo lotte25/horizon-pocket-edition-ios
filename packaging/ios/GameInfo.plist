@@ -206,6 +206,14 @@
 	<!-- Without it an iPhone caps every app at 60 Hz; with it ProMotion follows the game's frames. -->
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<!-- Opt into iOS 18+ Game Mode (prioritized CPU/GPU scheduling, lower Bluetooth controller/audio latency)
+	     and indirect pointer/trackpad input on iPadOS. -->
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<key>GCSupportsGameMode</key>
+	<true/>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

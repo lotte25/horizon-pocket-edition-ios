@@ -9,6 +9,10 @@
 //! inbox, `horizon-args.txt`) are in Library/Application Support/Starling, as Android's are in
 //! the app's own files.
 #[cfg(target_os = "ios")]
+#[global_allocator]
+static ALLOCATOR: horizon_threads::Allocator = horizon_threads::Allocator;
+
+#[cfg(target_os = "ios")]
 mod app;
 #[cfg(target_os = "ios")]
 mod dns;

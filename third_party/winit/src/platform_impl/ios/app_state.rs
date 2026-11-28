@@ -723,6 +723,7 @@ pub fn handle_events_cleared(mtm: MainThreadMarker) {
 
 pub(crate) fn terminated(application: &UIApplication) {
     let mtm = MainThreadMarker::from(application);
+    super::display_link::stop(mtm);
 
     let mut events = Vec::new();
     #[allow(deprecated)]

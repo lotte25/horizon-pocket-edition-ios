@@ -106,6 +106,10 @@ pub trait WindowExtIOS {
     /// [`contentScaleFactor`]: https://developer.apple.com/documentation/uikit/uiview/1622657-contentscalefactor?language=objc
     fn set_scale_factor(&self, scale_factor: f64);
 
+    /// Asks Core Animation for up to `frames_per_second` on ProMotion displays, or pauses the
+    /// hint link when `None`.
+    fn set_preferred_frame_rate(&self, frames_per_second: Option<u32>);
+
     /// Sets the valid orientations for the [`Window`].
     ///
     /// The default value is [`ValidOrientations::LandscapeAndPortrait`].
@@ -198,6 +202,11 @@ impl WindowExtIOS for Window {
     #[inline]
     fn set_scale_factor(&self, scale_factor: f64) {
         self.window.maybe_queue_on_main(move |w| w.set_scale_factor(scale_factor))
+    }
+
+    #[inline]
+    fn set_preferred_frame_rate(&self, frames_per_second: Option<u32>) {
+        self.window.maybe_queue_on_main(move |w| w.set_preferred_frame_rate(frames_per_second))
     }
 
     #[inline]

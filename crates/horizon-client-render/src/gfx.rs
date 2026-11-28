@@ -188,6 +188,7 @@ fn translucent_split(batching: bool, flat_draws: bool, terrain: bool, shadow: bo
 mod adreno;
 mod animate;
 mod arena;
+mod binding_cache;
 pub mod compositor;
 mod cull;
 mod end_sky;
@@ -1111,6 +1112,10 @@ pub struct Renderer {
     /// change. Empty-section tombstones remain until that section unloads so
     /// the static cache can remove deleted models without a global flush.
     block_entity_membership_revisions: FxHashMap<SectionKey, u64>,
+    /// Each section's block-entity marks (`visible_block_entities_in_frustum`) put together,
+    /// by the section's membership revision and the marks table they were worked out for.
+    /// A frame asks this of every section within 256 blocks, and the lists hardly change.
+    block_entity_marks: std::cell::RefCell<BlockEntityMarks>,
     /// When each section was first uploaded (`RenderSection.uploadedTime`): kept across meshing
     /// it again, gone with its column. Sections that fade in over far terrain are not in it.
     section_uploaded: FxHashMap<SectionKey, std::time::Instant>,
@@ -4042,7 +4047,7 @@ impl Renderer {
         // Android starts with it off (`section-cull on` or HORIZON_GPU_CULL=1 for A/B): on the
         // tiled GPU measured (Adreno 740) it saved no GPU time, and a block the player placed or
         // broke now and then left most of the terrain out of a frame, or a chunk out for longer.
-        let cull_on = cull.is_some() && (!crate::PHONE || cull_env.is_ok());
+        let cull_on = cull.is_some() && (!cfg!(target_os = "android") || cull_env.is_ok());
         let depth = Self::depth(&device, &config);
         let world_post = world_post::Post::new(
             &device,
@@ -4272,6 +4277,7 @@ impl Renderer {
             block_entities: Default::default(),
             block_entity_section_revisions: Default::default(),
             block_entity_membership_revisions: Default::default(),
+            block_entity_marks: Default::default(),
             section_uploaded: Default::default(),
             newest_upload: None,
             newest_lod_fade: None,
@@ -5143,14 +5149,23 @@ impl Renderer {
     /// check in the game. Sections wholly inside the frustum skip that finer
     /// check; sections outside it are kept only when a renderer needs to draw
     /// geometry extending beyond its block (beacon beams, gateways, outlines).
+    ///
+    /// `marks` holds each state's flags: 1, drawn off screen (a section holding one is kept
+    /// wherever it is); 2, drawn as far as 256 blocks (a section holding one is kept that far).
+    /// States past its end have none. An empty or absent table keeps nothing for either.
     pub fn visible_block_entities_in_frustum<'a>(
         &'a self,
         fade_seconds: f32,
         camera: DVec3,
         frustum: Option<Frustum>,
-        keep_section: impl Fn(u32) -> bool + 'a,
-        keep_long_range: impl Fn(u32) -> bool + 'a,
+        marks: Option<&'a Arc<[u8]>>,
     ) -> impl Iterator<Item = (&'a ([i32; 3], u32), bool)> + 'a {
+        let section_count = self.block_entities.len();
+        let marks_cache = &self.block_entity_marks;
+        let revisions = &self.block_entity_membership_revisions;
+        let section_marks = move |key: &SectionKey, blocks: &[([i32; 3], u32)]| -> u8 {
+            cached_section_mark(marks_cache, revisions, section_count, key, blocks, marks)
+        };
         let fade = fade_millis(fade_seconds);
         let now = Instant::now();
         // No section uploaded within the fade: all are whole, none is looked up.
@@ -5173,8 +5188,7 @@ impl Renderer {
                 let max = min + Vec3::splat(18.0);
                 let distance_squared = Vec3::ZERO.max(min).min(max).length_squared();
                 let in_range = distance_squared <= 64.0 * 64.0
-                    || (distance_squared <= 256.0 * 256.0
-                        && blocks.iter().any(|(_, state)| keep_long_range(*state)));
+                    || (distance_squared <= 256.0 * 256.0 && section_marks(key, blocks) & 2 != 0);
                 if !in_range {
                     return None;
                 }
@@ -5182,7 +5196,7 @@ impl Renderer {
                     let fully_inside = view.contains(min, max);
                     (fully_inside || view.intersects(min, max), fully_inside)
                 });
-                (intersects || blocks.iter().any(|(_, state)| keep_section(*state)))
+                (intersects || section_marks(key, blocks) & 1 != 0)
                     .then_some((blocks, fully_inside))
             })
             .flat_map(|(blocks, fully_inside)| {
@@ -5220,6 +5234,7 @@ impl Renderer {
         self.block_entities.clear();
         self.block_entity_section_revisions.clear();
         self.block_entity_membership_revisions.clear();
+        self.block_entity_marks.borrow_mut().sections.clear();
         self.section_uploaded.clear();
         self.newest_upload = None;
         self.newest_lod_fade = None;
@@ -5398,6 +5413,7 @@ impl Renderer {
                 block_entities |= self.block_entities.remove(&key).is_some();
                 self.block_entity_section_revisions.remove(&key);
                 self.block_entity_membership_revisions.remove(&key);
+                self.block_entity_marks.borrow_mut().sections.remove(&key);
                 if self.light_blocks.remove(&key).is_some() {
                     self.light_revision += 1;
                 }
@@ -6948,6 +6964,7 @@ impl Renderer {
             }
         };
         let mut opaque_draws = 0;
+        let mut phase2_opaque = 0;
         for (i, v) in visible.iter().enumerate() {
             let s = self.sections.get(v.slot);
             let first_phase = cull.as_ref().is_none_or(|c| c.first(v.slot));
@@ -6958,14 +6975,9 @@ impl Renderer {
             };
             let instances = u32::from(first_phase);
             let mut indices = 0;
-            // Phase 2 draws every quad, in both passes.
-            let parts = if first_phase {
-                parts(fade_code(s, &v.key) != 0)
-            } else {
-                &[(0, Quads::All)]
-            };
-            let whole = draws.len();
-            for &(group, part) in parts {
+            let parts = parts(fade_code(s, &v.key) != 0);
+            let mut runs = [(0, 0, 0); 2];
+            for (run, &(group, part)) in runs.iter_mut().zip(parts) {
                 let start = draws.len();
                 facing_runs_from(&s.sides, eye, mirror_low, v.origin, part, |first, quads| {
                     indices += quads * 6;
@@ -6973,28 +6985,33 @@ impl Renderer {
                     draws.push([quads * 6, instances, 0, base, i as u32]);
                     pages.push((s.page, None));
                 });
-                let len = draws.len() - start;
-                if first_phase {
+                *run = (group, start, draws.len() - start);
+            }
+            let runs = &runs[..parts.len()];
+            if first_phase {
+                for &(group, start, len) in runs {
                     if group == 0 {
                         opaque_draws += len;
                     }
                     self.solid_runs
                         .push_in(group, v.distance, s.page, start, len, [0; 3]);
                 }
-            }
-            if !first_phase {
-                self.phase2_runs.push(
-                    v.distance,
-                    s.page,
-                    whole,
-                    draws.len() - whole,
-                    [i as u32, v.slot, indices],
-                );
-            }
-            if let Some(c) = &mut cull
-                && first_phase
-            {
-                c.drawn(i, v.slot, indices);
+                if let Some(c) = &mut cull {
+                    c.drawn(i, v.slot, indices);
+                }
+            } else if let Some(c) = &mut cull {
+                // One test sees the section's draws in both passes.
+                let total: usize = runs.iter().map(|r| r.2).sum();
+                if let Some(test) = c.deferred(i, v.slot, total, indices) {
+                    for &(group, start, len) in runs {
+                        if group == 0 {
+                            phase2_opaque += len;
+                        }
+                        let tag = [test, u32::from(group), 0];
+                        self.phase2_runs
+                            .push_in(group, v.distance, s.page, start, len, tag);
+                    }
+                }
             }
         }
         // Phase 2's draws are tested where grouping left them.
@@ -7003,8 +7020,7 @@ impl Renderer {
             .regroup(&mut self.phase2_draws, &mut self.phase2_pages, 0);
         if let Some(c) = &mut cull {
             for r in runs {
-                let [i, slot, indices] = r.tag;
-                c.deferred(i as usize, slot, r.start as usize, r.len as usize, indices);
+                c.place(r.tag[0], r.tag[1], r.start, r.len);
             }
         }
         // Distant terrain tiles are never occlusion tested: phase 1.
@@ -7039,6 +7055,9 @@ impl Renderer {
         self.draw_pages.extend_from_slice(&self.phase2_pages);
         let culling = cull.is_some();
         let solid_draws = self.draws.len() as u32;
+        // Phase 2's draws `[phase1_draws..phase2_cutout]` hold opaque quads, the rest
+        // cutout ones (without the split, all of them go through one pipeline).
+        let phase2_cutout = phase1_draws + phase2_opaque as u32;
         laps.lap("r_section_groups");
         // LevelRenderer: nearby sections each frame, plus a rotating eighth
         // (at least 15) of the visible list. Cached views avoid needless sorts.
@@ -7726,7 +7745,7 @@ impl Renderer {
                         phase1_draws as usize,
                         solid_draws as usize,
                         [shadow_first, shadow_first + shadow_solid].map(|d| d as usize),
-                        [opaque_end, cutout_start],
+                        [opaque_end, cutout_start, phase2_cutout as usize],
                         phase2,
                         self.translucent_arena.is_some(),
                         visible
@@ -8379,26 +8398,30 @@ impl Renderer {
                 Some(flat) => {
                     let vertices = flat_vertices(&self.arena, self.translucent_arena.as_ref());
                     // Without a pack, on Metal, the opaque pass, then the cutout one
-                    // (terrain.wgsl's `opaque_quad`), each over phase 1's lists with
-                    // quads for it, and over all of phase 2's.
-                    let [opaque, cutout] = flat.pass_calls;
-                    let passes: &[(&wgpu::RenderPipeline, std::ops::Range<usize>)] = match pack_flat
-                    {
-                        Some(p) => &[(&p.0, 0..flat.phase1_calls)],
+                    // (terrain.wgsl's `opaque_quad`), each over phase 1's and phase 2's
+                    // calls with quads for it (phase 2's counted from its first).
+                    let [opaque, cutout, phase2_split] = flat.pass_calls;
+                    let phase2_split = phase2_split - flat.phase1_calls;
+                    let phase2_calls = flat.solid_calls - flat.phase1_calls;
+                    type Calls = std::ops::Range<usize>;
+                    let passes: &[(&wgpu::RenderPipeline, Calls, Calls)] = match pack_flat {
+                        Some(p) => &[(&p.0, 0..flat.phase1_calls, 0..phase2_calls)],
                         None if split_solid => &[
                             (
                                 solid_passes.opaque(true).unwrap_or(&flat.solid_opaque),
                                 0..opaque,
+                                0..phase2_split,
                             ),
                             (
                                 solid_passes.cutout(true).unwrap_or(&flat.solid_cutout),
                                 cutout..flat.phase1_calls,
+                                phase2_split..phase2_calls,
                             ),
                         ],
-                        None => &[(&flat.solid, 0..flat.phase1_calls)],
+                        None => &[(&flat.solid, 0..flat.phase1_calls, 0..phase2_calls)],
                     };
                     let draw = |pass: &mut wgpu::RenderPass<'_>| {
-                        for (pipeline, calls) in passes {
+                        for (pipeline, calls, _) in passes {
                             pass.set_pipeline(pipeline);
                             flat.draw(pass, &flat.calls[calls.clone()], vertices);
                         }
@@ -8429,9 +8452,9 @@ impl Renderer {
                             };
                             pass.set_bind_group(0, &self.group, &[]);
                             pack_frame(&mut pass);
-                            for (pipeline, _) in passes {
+                            for (pipeline, _, calls) in passes {
                                 pass.set_pipeline(pipeline);
-                                flat.draw_phase2(&mut pass, vertices);
+                                flat.draw_phase2(&mut pass, calls.clone(), vertices);
                             }
                         }
                         // Without culling, phase 1 is all the solid calls.
@@ -8443,20 +8466,23 @@ impl Renderer {
                 None => {
                     // Without a native material, on Metal, the opaque pass, then the
                     // cutout one (terrain.wgsl's `opaque_quad`), each over phase 1's
-                    // lists with quads for it, and over all of phase 2's.
+                    // and phase 2's lists with quads for it.
                     let (opaque, cutout) = (opaque_end as u32, cutout_start as u32);
-                    let passes: &[(&wgpu::RenderPipeline, std::ops::Range<u32>)] = match material {
+                    type Draws = std::ops::Range<u32>;
+                    let passes: &[(&wgpu::RenderPipeline, Draws, Draws)] = match material {
                         None if split_solid => &[
                             (
                                 solid_passes.opaque(false).unwrap_or(&self.solid_opaque),
                                 0..opaque,
+                                phase1_draws..phase2_cutout,
                             ),
                             (
                                 solid_passes.cutout(false).unwrap_or(&self.solid_cutout),
                                 cutout..phase1_draws,
+                                phase2_cutout..solid_draws,
                             ),
                         ],
-                        _ => &[(solid_pipeline, 0..phase1_draws)],
+                        _ => &[(solid_pipeline, 0..phase1_draws, phase1_draws..solid_draws)],
                     };
                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_vertex_buffer(1, self.instances.slice(..));
@@ -8466,7 +8492,7 @@ impl Renderer {
                             // its pass, or one of their own on Metal), then
                             // what they found in sight, in a pass that loads
                             // both targets (it reads the test's results).
-                            for (pipeline, draws) in passes {
+                            for (pipeline, draws, _) in passes {
                                 pass.set_pipeline(pipeline);
                                 self.draw_sections(
                                     &mut pass,
@@ -8501,20 +8527,20 @@ impl Renderer {
                                 wgpu::IndexFormat::Uint32,
                             );
                             pass.set_vertex_buffer(1, self.instances.slice(..));
-                            for (pipeline, _) in passes {
+                            for (pipeline, _, draws) in passes {
                                 pass.set_pipeline(pipeline);
                                 self.draw_sections(
                                     &mut pass,
                                     &cull.phase2,
                                     phase1_draws,
-                                    phase1_draws,
-                                    solid_draws - phase1_draws,
+                                    draws.start,
+                                    draws.len() as u32,
                                 );
                             }
                         }
                         // Without culling, phase 1 is all the solid draws.
                         None => {
-                            for (pipeline, draws) in passes {
+                            for (pipeline, draws, _) in passes {
                                 pass.set_pipeline(pipeline);
                                 self.draw_sections(
                                     &mut pass,
@@ -10131,6 +10157,34 @@ impl Frustum {
             p.truncate().dot(v) + p.w >= 0.0
         })
     }
+    /// Whether the camera-relative `point` is on or inside every plane (vanilla's
+    /// `Frustum.pointInFrustum`). A point that is not finite is kept.
+    pub fn contains_point(&self, point: Vec3) -> bool {
+        if !point.is_finite() {
+            return true;
+        }
+        self.planes
+            .iter()
+            .all(|plane| plane.truncate().dot(point) + plane.w >= 0.0)
+    }
+    /// The same frustum seen from a camera moved `blocks` back along the view direction
+    /// (vanilla's `Frustum.offset`): the sides open up near the camera and the near plane
+    /// moves behind it, so what sits just behind or beside the camera stays inside.
+    pub fn pulled_back(&self, blocks: f32) -> Frustum {
+        let sides: Vec3 = self.planes[..4].iter().map(|p| p.truncate()).sum();
+        let depth = self.planes[4].truncate();
+        let along = depth.dot(sides);
+        if along.abs() < 1.0e-3 {
+            return *self;
+        }
+        let toward_sides = if along > 0.0 { depth } else { -depth };
+        let axis = toward_sides.normalize_or_zero();
+        let mut planes = self.planes;
+        for plane in &mut planes {
+            plane.w += blocks * plane.truncate().dot(axis);
+        }
+        Frustum { planes }
+    }
 }
 /// Vanilla's `Projection`: reversed depth (near maps to 1, far to 0, tests
 /// are GREATER_THAN_OR_EQUAL), which keeps far faces a hair apart, like
@@ -11347,5 +11401,120 @@ fn reported(l: horizon_hdr::wayland::Luminances) -> crate::graphics::Reported {
         paper_white: 203,
         peak: peak.clamp(200, 10_000),
         black: hundredths_of_a_nit(l.target_min * 203.0 / l.reference.max(1.0)),
+    }
+}
+
+/// `Renderer::block_entity_marks`: the immutable marks table they were worked out for and each
+/// section's (membership revision, marks). Keeping the allocation alive prevents address reuse.
+#[derive(Default)]
+struct BlockEntityMarks {
+    table: Option<Arc<[u8]>>,
+    sections: FxHashMap<SectionKey, (u64, u8)>,
+}
+
+/// The OR of `marks` over `blocks`, remembered while `key`'s membership revision is unchanged.
+fn cached_section_mark(
+    cache: &std::cell::RefCell<BlockEntityMarks>,
+    revisions: &FxHashMap<SectionKey, u64>,
+    section_count: usize,
+    key: &SectionKey,
+    blocks: &[([i32; 3], u32)],
+    marks: Option<&Arc<[u8]>>,
+) -> u8 {
+    let Some(marks) = marks else {
+        return 0;
+    };
+    if marks.is_empty() {
+        return 0;
+    }
+    let worked = || {
+        blocks.iter().fold(0u8, |all, (_, state)| {
+            all | marks.get(*state as usize).copied().unwrap_or(0)
+        })
+    };
+    let Some(&revision) = revisions.get(key) else {
+        return worked();
+    };
+    let mut cache = cache.borrow_mut();
+    if !cache
+        .table
+        .as_ref()
+        .is_some_and(|table| Arc::ptr_eq(table, marks))
+        || cache.sections.len() > 2 * section_count + 64
+    {
+        cache.table = Some(marks.clone());
+        cache.sections.clear();
+    }
+    match cache.sections.get(key) {
+        Some(&(kept, mark)) if kept == revision => mark,
+        _ => {
+            let mark = worked();
+            cache.sections.insert(*key, (revision, mark));
+            mark
+        }
+    }
+}
+
+#[cfg(test)]
+mod block_entity_mark_tests {
+    use super::*;
+
+    fn or_scan(blocks: &[([i32; 3], u32)], marks: &[u8]) -> u8 {
+        blocks.iter().fold(0u8, |all, (_, state)| {
+            all | marks.get(*state as usize).copied().unwrap_or(0)
+        })
+    }
+
+    #[test]
+    fn a_sections_marks_are_remembered_until_its_revision_changes() {
+        let cache = std::cell::RefCell::new(BlockEntityMarks::default());
+        let mut revisions = FxHashMap::default();
+        let key = (1, 2, 3);
+        revisions.insert(key, 7);
+        let marks: Arc<[u8]> = Arc::from([0u8, 1, 2, 3]);
+        let blocks = vec![([0, 0, 0], 1u32), ([1, 0, 0], 2)];
+        let first = cached_section_mark(&cache, &revisions, 1, &key, &blocks, Some(&marks));
+        assert_eq!(first, or_scan(&blocks, &marks));
+        assert_eq!(first, 3);
+        let stale = vec![([0, 0, 0], 0u32)];
+        assert_eq!(
+            cached_section_mark(&cache, &revisions, 1, &key, &stale, Some(&marks)),
+            first
+        );
+        revisions.insert(key, 8);
+        assert_eq!(
+            cached_section_mark(&cache, &revisions, 1, &key, &stale, Some(&marks)),
+            0
+        );
+        assert_eq!(
+            cached_section_mark(&cache, &revisions, 1, &key, &blocks, None),
+            0
+        );
+    }
+
+    #[test]
+    fn replacing_or_editing_the_marks_table_invalidates_section_marks() {
+        let cache = std::cell::RefCell::new(BlockEntityMarks::default());
+        let key = (1, 2, 3);
+        let revisions = FxHashMap::from_iter([(key, 7)]);
+        let blocks = [([0, 0, 0], 1u32)];
+        let mut marks: Arc<[u8]> = Arc::from([0u8, 1]);
+        assert_eq!(
+            cached_section_mark(&cache, &revisions, 1, &key, &blocks, Some(&marks)),
+            1
+        );
+        assert!(Arc::get_mut(&mut marks).is_none());
+        Arc::make_mut(&mut marks)[1] = 2;
+        assert!(!Arc::ptr_eq(cache.borrow().table.as_ref().unwrap(), &marks));
+        assert_eq!(
+            cached_section_mark(&cache, &revisions, 1, &key, &blocks, Some(&marks)),
+            2
+        );
+        drop(marks);
+        let replacement: Arc<[u8]> = Arc::from([0u8, 3]);
+        assert_eq!(
+            cached_section_mark(&cache, &revisions, 1, &key, &blocks, Some(&replacement)),
+            3
+        );
     }
 }

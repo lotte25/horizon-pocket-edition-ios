@@ -1033,10 +1033,14 @@ impl Graphics {
         // and render threads are raised above four cores, where vanilla
         // raises its server thread). Leaving two idled a core of a 4-thread
         // laptop while a world loaded: a teleport there took ~15% longer.
-        // A phone leaves two, as Starling was measured with: half its cores are small ones, and
-        // a hot phone slows every core down.
-        let spare = if crate::PHONE { 2 } else { 1 };
-        let auto = horizon_threads::worker_count().saturating_sub(spare).max(1);
+        // On Apple silicon (iOS / macOS) `default_threads()` counts only P-cores
+        // (`hw.perflevel0.physicalcpu`) so chunk workers don't saturate E-cores and
+        // starve render/server threads. On Android leave two cores spare.
+        let auto = if cfg!(target_os = "android") {
+            horizon_threads::worker_count().saturating_sub(2).max(1)
+        } else {
+            horizon_threads::jobs::default_threads()
+        };
         if self.battery { auto.div_ceil(2) } else { auto }
     }
     /// The frame cap battery mode adds: 60 in a world, 30 in menus without a
@@ -1095,7 +1099,8 @@ pub fn apply_preset(preset: Preset, s: &mut crate::settings::Settings) {
 pub fn apply_mobile_defaults(tier: crate::system_stats::Tier, s: &mut crate::settings::Settings) {
     use crate::system_stats::Tier;
     let high = tier == Tier::High;
-    s.max_fps = 60;
+    // iOS ProMotion devices support up to 120 Hz and dynamic CADisplayLink follows the cap.
+    s.max_fps = if cfg!(target_os = "ios") { 120 } else { 60 };
     s.render_distance = match tier {
         Tier::High => 10,
         Tier::Mid => 8,
@@ -1119,10 +1124,17 @@ pub fn apply_mobile_defaults(tier: crate::system_stats::Tier, s: &mut crate::set
     s.graphics_preset = "custom".into();
     let g = &mut s.horizon;
     g.preset = Preset::Custom;
-    g.resolution_scale = match tier {
-        Tier::High => 100,
-        Tier::Mid => 85,
-        Tier::Low => 70,
+    // On iOS, keep 100% native resolution by default so the renderer stays on the direct
+    // swapchain + `hand_in_world` fast path instead of paying `world_post`'s offscreen RT,
+    // fullscreen blit, and separate hand render pass on Metal.
+    g.resolution_scale = if cfg!(target_os = "ios") {
+        100
+    } else {
+        match tier {
+            Tier::High => 100,
+            Tier::Mid => 85,
+            Tier::Low => 70,
+        }
     };
     g.animated_textures = tier != Tier::Low;
     // A phone's GPU is an integrated one, which far terrain slows most.
@@ -1509,8 +1521,7 @@ mod tests {
     fn automatic_workers_leave_a_core_as_vanilla_does() {
         let g = Graphics::default();
         assert_eq!(g.workers, 0);
-        let cores = horizon_threads::worker_count();
-        assert_eq!(g.worker_threads(), cores.saturating_sub(1).max(1));
+        assert_eq!(g.worker_threads(), horizon_threads::default_workers());
         // A manual count is the player's own choice, kept as asked.
         let manual = Graphics { workers: 3, ..g };
         assert_eq!(manual.worker_threads(), 3);

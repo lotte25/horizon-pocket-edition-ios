@@ -18,6 +18,7 @@
 //! reserves room for all of its draws, the copy packs the seen ones at its
 //! start, and the run is drawn indirectly with the count the copy reached.
 use super::arena::GRAIN;
+use super::binding_cache::BindingKey;
 
 /// One section draw for `flatten.wgsl`: index count, first sorted index (or
 /// `QUADS` for a solid draw; phase 2: its entry in phase 2's draws), base
@@ -42,8 +43,9 @@ struct Plan {
     solid_calls: usize,
     /// Where the shadow camera's solid and translucent calls begin.
     shadow_calls: [usize; 2],
-    /// Where Metal's opaque pass ends and its cutout pass begins in phase 1's calls.
-    pass_calls: [usize; 2],
+    /// Where Metal's opaque pass ends and its cutout pass begins in phase 1's calls,
+    /// and where its cutout pass begins in phase 2's.
+    pass_calls: [usize; 3],
     total: u64,
 }
 const QUADS: u32 = u32::MAX;
@@ -57,6 +59,11 @@ struct PageTable {
     /// Section id of every block of the page.
     blocks: wgpu::Buffer,
     group: Option<wgpu::BindGroup>,
+}
+
+struct CachedGroup<const N: usize> {
+    key: BindingKey<wgpu::Buffer, N>,
+    group: wgpu::BindGroup,
 }
 
 /// Writes the fragment's alpha over the frame's and leaves its colour.
@@ -99,7 +106,9 @@ pub struct Flat {
     phase2_call_capacity: u64,
     phase2_call_data: Vec<[u32; 5]>,
     /// The copy of phase 2's draws, and its ranges.
-    phase2_group: Option<(wgpu::BindGroup, u32)>,
+    phase2_group: Option<CachedGroup<4>>,
+    /// The copy of phase 1's and the translucent draws, one group per segment.
+    groups: Vec<CachedGroup<3>>,
     /// The layout of a page's bind group 1 (shader packs' terrain pipelines share it).
     pub(super) draw_layout: wgpu::BindGroupLayout,
     blocks_per_page: u64,
@@ -127,9 +136,9 @@ pub struct Flat {
     pub calls: Vec<Call>,
     pub phase1_calls: usize,
     pub solid_calls: usize,
-    /// Metal's two solid passes over phase 1: the opaque one draws
-    /// `calls[..pass_calls[0]]`, the cutout one `calls[pass_calls[1]..phase1_calls]`.
-    pub pass_calls: [usize; 2],
+    /// Metal's two solid passes: phase 1's opaque (`calls[..pass_calls[0]]`) and cutout
+    /// (`calls[pass_calls[1]..phase1_calls]`), and phase 2's split (`pass_calls[2]`).
+    pub pass_calls: [usize; 3],
     /// Where a shader pack's shadow camera's solid and translucent calls
     /// begin (`calls.len()` without them): the camera's translucent calls
     /// end at the first.
@@ -278,7 +287,7 @@ fn plan(
     phase1_draws: usize,
     solid_draws: usize,
     shadow: [usize; 2],
-    passes: [usize; 2],
+    passes: [usize; 3],
     align: u64,
     key: impl Fn(u32, Option<u32>) -> u32,
     calls: &mut Vec<Call>,
@@ -290,7 +299,7 @@ fn plan(
     segments.clear();
     let (mut phase1_calls, mut solid_calls) = (None, None);
     let mut shadow_calls = [None; 2];
-    let mut pass_calls = [None; 2];
+    let mut pass_calls = [None; 3];
     let mut total = 0u64;
     let mut by_source: Vec<(Source, Vec<Range>)> = Vec::new();
     for (i, (d, &(page, sorted))) in draws.iter().zip(pages).enumerate() {
@@ -352,7 +361,14 @@ fn plan(
         phase1_calls,
         solid_calls,
         shadow_calls: shadow_calls.map(|c| c.unwrap_or(calls.len())),
-        pass_calls: pass_calls.map(|c| c.unwrap_or(calls.len()).min(phase1_calls)),
+        pass_calls: {
+            let [opaque, cutout, phase2] = pass_calls.map(|c| c.unwrap_or(calls.len()));
+            [
+                opaque.min(phase1_calls),
+                cutout.min(phase1_calls),
+                phase2.clamp(phase1_calls, solid_calls),
+            ]
+        },
         total,
     }
 }
@@ -489,6 +505,7 @@ impl Flat {
             phase2_call_capacity: 1,
             phase2_call_data: Vec::new(),
             phase2_group: None,
+            groups: Vec::new(),
             draw_layout,
             blocks_per_page: page_vertices.div_ceil(GRAIN),
             translucent_blocks_per_page: page_vertices.div_ceil(GRAIN),
@@ -513,7 +530,7 @@ impl Flat {
             calls: Vec::new(),
             phase1_calls: 0,
             solid_calls: 0,
-            pass_calls: [0; 2],
+            pass_calls: [0; 3],
             shadow_calls: [0; 2],
             min_sections,
             range_align: (u64::from(device.limits().min_storage_buffer_offset_alignment) / 16)
@@ -597,6 +614,8 @@ impl Flat {
     }
     pub fn clear(&mut self) {
         self.pages.clear();
+        self.groups.clear();
+        self.phase2_group = None;
         self.free_ids.clear();
         self.next_id = 0;
     }
@@ -629,14 +648,13 @@ impl Flat {
         phase1_draws: usize,
         solid_draws: usize,
         shadow: [usize; 2],
-        passes: [usize; 2],
+        passes: [usize; 3],
         phase2: Option<&wgpu::Buffer>,
         translucent_arena: bool,
         origins: impl Iterator<Item = (u32, [f32; 4])>,
         sorted_page: impl Fn(u32) -> wgpu::Buffer,
         timing: Option<&mut super::pack_timing::PassTiming>,
     ) -> bool {
-        self.phase2_group = None;
         let phase1_draws = if phase2.is_some() {
             phase1_draws
         } else {
@@ -699,11 +717,14 @@ impl Flat {
         self.shadow_calls = shadow_calls;
         self.pass_calls = pass_calls;
         if total == 0 || total * 4 > device.limits().max_storage_buffer_binding_size {
+            // Do not retain bindings for a frame that cannot use flat draws.
+            self.phase2_group = None;
+            self.groups.clear();
             self.calls.clear();
             self.phase1_calls = 0;
             self.solid_calls = 0;
             self.shadow_calls = [0; 2];
-            self.pass_calls = [0; 2];
+            self.pass_calls = [0; 3];
             return false;
         }
         if self.range_data.len() as u64 > self.range_capacity {
@@ -766,39 +787,63 @@ impl Flat {
             phase2,
             self.segments.iter().find(|(s, ..)| *s == Source::Seen),
         ) {
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Flatten phase 2 section draws"),
-                layout: &self.seen_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: ranges_at(first, count),
+            let buffers = [&self.ranges, &self.indices, phase2, &self.phase2_calls];
+            if !self
+                .phase2_group
+                .as_ref()
+                .is_some_and(|cached| cached.key.matches(first, count, buffers))
+            {
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Flatten phase 2 section draws"),
+                    layout: &self.seen_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ranges_at(first, count),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.indices.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: phase2.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.phase2_calls.as_entire_binding(),
+                        },
+                    ],
+                });
+                self.phase2_group = Some(CachedGroup {
+                    key: BindingKey {
+                        first,
+                        count,
+                        buffers: buffers.map(|b| b.clone()),
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.indices.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: phase2.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: self.phase2_calls.as_entire_binding(),
-                    },
-                ],
-            });
-            self.phase2_group = Some((group, count as u32));
+                    group,
+                });
+            }
+        } else {
+            self.phase2_group = None;
         }
-        let groups: Vec<(wgpu::BindGroup, u32)> = self
-            .segments
-            .iter()
-            .filter_map(|&(source, first, count)| {
-                let sorted = match source {
-                    Source::Quads => None,
-                    Source::Seen => return None,
-                    Source::Sorted(page) => Some(sorted_page(page)),
-                };
+        let mut groups = 0;
+        for &(source, first, count) in &self.segments {
+            let sorted = match source {
+                Source::Quads => None,
+                Source::Seen => continue,
+                Source::Sorted(page) => Some(sorted_page(page)),
+            };
+            let buffers = [
+                &self.ranges,
+                sorted.as_ref().unwrap_or(&self.empty),
+                &self.indices,
+            ];
+            if self
+                .groups
+                .get(groups)
+                .is_none_or(|cached| !cached.key.matches(first, count, buffers))
+            {
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Flatten section draws"),
                     layout: &self.compute_layout,
@@ -809,7 +854,7 @@ impl Flat {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: sorted.as_ref().unwrap_or(&self.empty).as_entire_binding(),
+                            resource: buffers[1].as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -817,17 +862,32 @@ impl Flat {
                         },
                     ],
                 });
-                Some((group, count as u32))
-            })
-            .collect();
+                let cached = CachedGroup {
+                    key: BindingKey {
+                        first,
+                        count,
+                        buffers: buffers.map(|b| b.clone()),
+                    },
+                    group,
+                };
+                if groups < self.groups.len() {
+                    self.groups[groups] = cached;
+                } else {
+                    self.groups.push(cached);
+                }
+            }
+            groups += 1;
+        }
+        self.groups.truncate(groups);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Flatten section draws"),
             timestamp_writes: timing.and_then(|t| t.compute_writes("Flatten")),
         });
         pass.set_pipeline(&self.flatten);
-        for (group, count) in &groups {
-            pass.set_bind_group(0, group, &[]);
-            pass.dispatch_workgroups((*count).min(GROUP_LIMIT), count.div_ceil(GROUP_LIMIT), 1);
+        for cached in &self.groups {
+            let count = cached.key.count as u32;
+            pass.set_bind_group(0, &cached.group, &[]);
+            pass.dispatch_workgroups(count.min(GROUP_LIMIT), count.div_ceil(GROUP_LIMIT), 1);
         }
         drop(pass);
         for page in self.calls.iter().map(|c| c.page) {
@@ -859,16 +919,17 @@ impl Flat {
         encoder: &mut wgpu::CommandEncoder,
         timing: Option<&mut super::pack_timing::PassTiming>,
     ) {
-        let Some((group, count)) = &self.phase2_group else {
+        let Some(cached) = &self.phase2_group else {
             return;
         };
+        let count = cached.key.count as u32;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Flatten phase 2 section draws"),
             timestamp_writes: timing.and_then(|t| t.compute_writes("Flatten phase 2")),
         });
         pass.set_pipeline(&self.flatten_seen);
-        pass.set_bind_group(0, group, &[]);
-        pass.dispatch_workgroups((*count).min(GROUP_LIMIT), count.div_ceil(GROUP_LIMIT), 1);
+        pass.set_bind_group(0, &cached.group, &[]);
+        pass.dispatch_workgroups(count.min(GROUP_LIMIT), count.div_ceil(GROUP_LIMIT), 1);
     }
 
     /// The camera's translucent calls.
@@ -919,19 +980,22 @@ impl Flat {
             pass.draw(call.first..call.first + call.count, 0..instances);
         }
     }
-    /// Draws phase 2's calls, as `flatten_phase2` left them.
+    /// Draws phase 2's `calls` (`calls[phase1_calls..solid_calls]` counted from 0), as
+    /// `flatten_phase2` left them.
     pub fn draw_phase2<'a>(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
+        calls: std::ops::Range<usize>,
         vertices: impl Fn(u32) -> wgpu::BufferSlice<'a>,
     ) {
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-        for (k, call) in self.calls[self.phase1_calls..self.solid_calls]
+        let first = self.phase1_calls + calls.start;
+        for (k, call) in self.calls[first..self.phase1_calls + calls.end]
             .iter()
             .enumerate()
         {
             self.bind_page(pass, call.page, &vertices);
-            pass.draw_indexed_indirect(&self.phase2_calls, k as u64 * 20);
+            pass.draw_indexed_indirect(&self.phase2_calls, (calls.start + k) as u64 * 20);
         }
     }
     fn bind_page<'a>(
@@ -991,7 +1055,7 @@ mod tests {
             solid,
             solid,
             [draws.len(); 2],
-            [draws.len(), 0],
+            [draws.len(), 0, solid],
             4,
             |page, _| page,
             &mut calls,
@@ -1040,14 +1104,14 @@ mod tests {
             solid,
             solid,
             [draws.len(); 2],
-            [3, 1],
+            [3, 1, solid],
             4,
             |page, _| page,
             &mut calls,
             &mut ranges,
             &mut segments,
         );
-        assert_eq!((plan.pass_calls, plan.solid_calls), ([3, 1], 4));
+        assert_eq!((plan.pass_calls, plan.solid_calls), ([3, 1, 4], 4));
         let call = |page, first, count| Call { page, first, count };
         assert_eq!(
             calls,
@@ -1076,7 +1140,7 @@ mod tests {
             solid,
             solid,
             [camera, camera + 2],
-            [camera, 0],
+            [camera, 0, solid],
             4,
             |page, _| page,
             &mut calls,
@@ -1105,7 +1169,7 @@ mod tests {
             2,
             solid,
             [draws.len(); 2],
-            [draws.len(), 0],
+            [draws.len(), 0, 3],
             4,
             |page, _| page,
             &mut calls,
@@ -1118,7 +1182,7 @@ mod tests {
                 phase1_calls: 1,
                 solid_calls: 3,
                 shadow_calls: [4, 4],
-                pass_calls: [1, 0],
+                pass_calls: [1, 0, 2],
                 total: 6 * 13
             }
         );
@@ -1223,7 +1287,7 @@ mod tests {
                 phase1,
                 solid,
                 [draws.len(); 2],
-                [draws.len(), 0],
+                [draws.len(), 0, solid],
                 align,
                 |page, _| page,
                 &mut calls,

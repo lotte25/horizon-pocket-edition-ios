@@ -29,6 +29,81 @@ pub fn worker_count() -> usize {
     })
 }
 
+/// The chunk worker pool's automatic size (`jobs::default_threads`, Graphics > Worker
+/// threads on Auto): every core but one, as vanilla's `Util.maxAllowedExecutorThreads`,
+/// counting on Apple silicon only its performance cores. Its efficiency cores are slower,
+/// and workers there kept the render and server threads waiting for a performance core: on
+/// a base M4 (4 performance and 6 efficiency cores) a fast flight's p99 frame went from
+/// 20 ms with 9 workers to 7 ms with 3 (#11294).
+pub fn default_workers() -> usize {
+    workers_for(worker_count(), performance_cores)
+}
+
+/// [`default_workers`] for `cores` cores, of which `performance` (asked only here, the
+/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere):
+/// one less than the smaller count, at least 1.
+fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
+    let fast = performance().filter(|&n| n > 0).unwrap_or(cores);
+    cores.min(fast).saturating_sub(1).max(1)
+}
+
+/// The machine's performance cores:
+/// - on Apple silicon (iOS / macOS) via `hw.perflevel0.physicalcpu`
+/// - on Linux by comparing max frequencies in `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`
+#[cfg(target_vendor = "apple")]
+fn performance_cores() -> Option<usize> {
+    let mut count: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a NUL-terminated name; `count` and `size` are live locals of the size passed.
+    let read = unsafe {
+        libc::sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut count).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (read == 0 && count > 0).then_some(count as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn performance_cores() -> Option<usize> {
+    let mut max_freq = 0u64;
+    let mut freqs = Vec::new();
+    let mut cpu_idx = 0;
+    loop {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu_idx}/cpufreq/cpuinfo_max_freq");
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                if let Ok(freq) = content.trim().parse::<u64>() {
+                    max_freq = max_freq.max(freq);
+                    freqs.push(freq);
+                }
+                cpu_idx += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    if freqs.is_empty() {
+        return None;
+    }
+    let min_freq = *freqs.iter().min()?;
+    if min_freq < max_freq {
+        let threshold = max_freq.saturating_sub(max_freq / 20);
+        let p_threads = freqs.iter().filter(|&&f| f >= threshold).count();
+        if p_threads > 0 && p_threads < freqs.len() {
+            return Some(p_threads);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+fn performance_cores() -> Option<usize> {
+    None
+}
+
 /// `Some(n)` when `value` names a positive count (`" 4 "` counts; `"0"`,
 /// `"lots"`, a missing variable don't).
 fn parse_worker_count(value: Option<String>) -> Option<usize> {
@@ -157,6 +232,61 @@ fn behind() -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn behind() -> bool {
     false
+}
+
+/// Called by a far terrain thread as it starts (sampling, meshing and decorating
+/// distant tiles): work the near chunks, the ticks and the frames must never
+/// wait behind. On Apple platforms sets `QOS_CLASS_UTILITY` so near-terrain,
+/// render, and server threads stay ahead without stalling on battery.
+pub fn far_terrain_current() -> bool {
+    far()
+}
+
+#[cfg(not(any(target_vendor = "apple", windows)))]
+fn far() -> bool {
+    behind_server()
+}
+
+#[cfg(target_vendor = "apple")]
+fn far() -> bool {
+    // SAFETY: sets the calling thread's own QoS class; no pointers.
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn far() -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    // SAFETY: GetCurrentThread's pseudo handle needs no closing.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) != 0 }
+}
+
+/// For a far terrain thread that `far_terrain_current` lowered: behind the
+/// near terrain while it loads (`behind`), and back to default once it is in.
+#[cfg(any(target_vendor = "apple", windows))]
+pub fn far_terrain_behind(behind: bool) -> bool {
+    if behind { far() } else { far_back() }
+}
+
+#[cfg(not(any(target_vendor = "apple", windows)))]
+pub fn far_terrain_behind(_behind: bool) -> bool {
+    false
+}
+
+#[cfg(target_vendor = "apple")]
+fn far_back() -> bool {
+    // SAFETY: sets the calling thread's own QoS class; no pointers.
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn far_back() -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_NORMAL,
+    };
+    // SAFETY: GetCurrentThread's pseudo handle needs no closing.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) != 0 }
 }
 
 /// Run the calling thread only on a core nothing else wants: work that may
@@ -559,6 +689,18 @@ mod tests {
         }
         super::configure_allocator();
         assert_eq!(get(), 0);
+    }
+
+    #[test]
+    fn workers_for_uses_performance_cores_when_known() {
+        // Apple 2P+4E (iPhone): keep 1 P-core for the render/main loop, 1 for workers.
+        assert_eq!(super::workers_for(6, || Some(2)), 1);
+        // Apple 4P+2E (M-series / newer iPad): leave 1 P-core free, use 3.
+        assert_eq!(super::workers_for(6, || Some(4)), 3);
+        // Single-core or unknown perflevel falls back to total - 1, at least 1.
+        assert_eq!(super::workers_for(8, || None), 7);
+        assert_eq!(super::workers_for(1, || None), 1);
+        assert_eq!(super::workers_for(4, || Some(0)), 3);
     }
 }
 

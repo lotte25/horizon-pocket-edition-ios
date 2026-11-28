@@ -5,16 +5,99 @@ use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::WindowId;
 
-/// The stack every event-loop callback runs on, and how much of it must be left before one: the
-/// desktop's main thread has 8 MB; a joining splitscreen player's Game is ~67 KB of it alone.
+/// The persistent stack every event-loop callback runs on: iOS gives its main thread 1 MiB,
+/// while a joining splitscreen player's `Game` is ~67 KiB alone and shader/worldgen paths go
+/// deeper. Keeping one persistent 16 MiB guarded mapping avoids `stacker::maybe_grow`'s
+/// per-callback `mmap`/`mprotect`/page-fault/`munmap` + TLB-shootdown churn on every UIKit event.
 const GAME_STACK: usize = 16 << 20;
-const GAME_STACK_LEFT: usize = 8 << 20;
 
 /// The mod API level this game serves, kept in the program as the desktop's main.rs keeps it.
 static MOD_API_LEVEL: [u8; 27] = horizon_mods::api_level::MARK;
 
+struct PersistentStack {
+    base: *mut u8,
+    size: usize,
+}
+
+impl PersistentStack {
+    fn new(requested_size: usize) -> Self {
+        // SAFETY: POSIX `sysconf(_SC_PAGE_SIZE)`, `mmap`, and `mprotect` on a fresh
+        // anonymous private mapping with one `PROT_NONE` guard page at each end.
+        unsafe {
+            let page_size = (libc::sysconf(libc::_SC_PAGE_SIZE).max(4096)) as usize;
+            let requested_pages = requested_size.div_ceil(page_size).max(1);
+            let total_size = (requested_pages + 2)
+                .checked_mul(page_size)
+                .expect("Horizon: game stack size overflow");
+            let mapping = libc::mmap(
+                std::ptr::null_mut(),
+                total_size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(
+                mapping,
+                libc::MAP_FAILED,
+                "Horizon: mmap failed for game stack: {}",
+                std::io::Error::last_os_error()
+            );
+            let base = (mapping as *mut u8).add(page_size);
+            let usable = requested_pages * page_size;
+            let res = libc::mprotect(
+                base as *mut libc::c_void,
+                usable,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+            assert_ne!(
+                res,
+                -1,
+                "Horizon: mprotect failed for game stack: {}",
+                std::io::Error::last_os_error()
+            );
+            Self { base, size: usable }
+        }
+    }
+}
+
 fn on_game_stack<R>(callback: impl FnOnce() -> R) -> R {
-    stacker::maybe_grow(GAME_STACK_LEFT, GAME_STACK, callback)
+    use std::cell::{Cell, OnceCell};
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+    thread_local! {
+        static STACK: OnceCell<PersistentStack> = const { OnceCell::new() };
+        static IN_USE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    // Re-entrant UIKit callbacks while already on the persistent 16 MiB stack run in place.
+    if IN_USE.with(Cell::get) {
+        return callback();
+    }
+
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            IN_USE.with(|flag| flag.set(false));
+        }
+    }
+
+    let (base, size) = STACK.with(|cell| {
+        let s = cell.get_or_init(|| PersistentStack::new(GAME_STACK));
+        (s.base, s.size)
+    });
+    IN_USE.with(|flag| flag.set(true));
+    let _guard = ActiveGuard;
+    // SAFETY: `base..base+size` is page-aligned, writable, guarded at both ends, and
+    // exclusively owned by this thread while `IN_USE` is true; `catch_unwind` prevents
+    // any panic from unwinding across `psm::on_stack`.
+    let result =
+        unsafe { psm::on_stack(base, size, move || catch_unwind(AssertUnwindSafe(callback))) };
+    drop(_guard);
+    match result {
+        Ok(val) => val,
+        Err(payload) => resume_unwind(payload),
+    }
 }
 
 /// The game folder (Documents) and the private one (Library/Application Support/Starling).
@@ -246,10 +329,8 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if !self.started {
             self.started = true;
-            // A 120 Hz screen runs an app at 60 unless the app asks for more.
-            if let Some(rate) = horizon_gamecontroller::request_high_frame_rate() {
-                log::info!("Horizon: asked iOS for {rate} frames a second");
-            }
+            // ProMotion refresh rates are driven dynamically by winit's pauseable CADisplayLink
+            // via `WindowExtIOS::set_preferred_frame_rate` inside `Game::limit_frame`.
             self.start_game(event_loop);
             self.after_callback(event_loop);
             return;

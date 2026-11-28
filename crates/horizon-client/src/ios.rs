@@ -152,6 +152,11 @@ pub fn ime_height() -> u32 {
     horizon_gamecontroller::keyboard_height()
 }
 
+fn heap_bytes() -> u64 {
+    horizon_gamecontroller::heap_in_use()
+        .saturating_add(horizon_threads::allocator_commit().0 as u64)
+}
+
 /// Registers the platform's hooks and probes, before the game starts.
 pub fn install() {
     crate::platform::set(crate::platform::Hooks {
@@ -167,7 +172,7 @@ pub fn install() {
         keep_working,
     });
     crate::system_stats::set_probes(crate::system_stats::Probes {
-        heap_bytes: horizon_gamecontroller::heap_in_use,
+        heap_bytes,
         thermal_status,
         thermal_headroom,
     });
