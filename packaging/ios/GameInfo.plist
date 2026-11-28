@@ -208,6 +208,8 @@
 	<true/>
 	<!-- Opt into iOS 18+ Game Mode (prioritized CPU/GPU scheduling, lower Bluetooth controller/audio latency)
 	     and indirect pointer/trackpad input on iPadOS. -->
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
 	<key>LSSupportsGameMode</key>
 	<true/>
 	<key>GCSupportsGameMode</key>

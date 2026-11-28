@@ -42,8 +42,12 @@ declare_class!(
         #[method(viewDidAppear:)]
         fn view_did_appear(&self, animated: bool) {
             let _: () = unsafe { msg_send![super(self), viewDidAppear: animated] };
-            // A full-screen launcher stole first responder; restore gameplay keyboard focus.
+            // A full-screen launcher stole first responder; restore gameplay keyboard focus
+            // and keep window-level system gesture gates from delaying bottom-edge touches.
             if let Some(view) = self.view() {
+                if let Some(window) = view.window() {
+                    super::view::disable_system_gesture_delays(&window);
+                }
                 unsafe {
                     view.becomeFirstResponder();
                 }

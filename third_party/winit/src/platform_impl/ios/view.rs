@@ -5,13 +5,15 @@ use std::collections::HashMap;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
+use objc2_foundation::{
+    CGFloat, CGPoint, CGRect, CGSize, MainThreadMarker, NSObject, NSSet, NSString,
+};
 use objc2_ui_kit::{
     UICoordinateSpace, UIEditingInteractionConfiguration, UIEvent, UIForceTouchCapability,
     UIGestureRecognizer, UIGestureRecognizerDelegate, UIGestureRecognizerState,
     UIHoverGestureRecognizer, UIKeyInput, UIPanGestureRecognizer, UIPinchGestureRecognizer,
     UIPress, UIPressesEvent, UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer,
-    UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
+    UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView, UIWindow,
 };
 
 use super::app_state::{self, EventWrapper};
@@ -36,9 +38,148 @@ pub struct WinitViewState {
     pinch_last_delta: Cell<CGFloat>,
     pan_last_delta: Cell<CGPoint>,
     ime_allowed: Cell<bool>,
-    hidden_input: Retained<UIView>,
+    ime_view: Retained<WinitTextInputView>,
     held_keys: RefCell<HashMap<usize, KeyEvent>>,
     mouse: super::hardware_mouse::Mouse,
+}
+
+/// Disable `delaysTouchesBegan` on UIKit's window-level `_UISystemGestureGateGestureRecognizer`
+/// instances so taps and 3rd-finger presses near the bottom edge (D-pad Down, hotbar) reach
+/// `touchesBegan:withEvent:` immediately instead of being delayed or swallowed.
+pub(crate) fn disable_system_gesture_delays(window: &UIWindow) {
+    if let Some(recognizers) = window.gestureRecognizers() {
+        for gr in recognizers.iter() {
+            if gr.class().name().contains("SystemGestureGate") {
+                unsafe {
+                    gr.setDelaysTouchesBegan(false);
+                }
+            }
+        }
+    }
+}
+
+declare_class!(
+    /// Dedicated invisible text-input responder kept as a 1x1 pass-through child of `WinitView`.
+    /// Keeping `UIKeyInput` off `WinitView` prevents UIKit from activating 3-finger text-editing
+    /// and selection gesture interceptors over the gameplay canvas while still allowing the iOS
+    /// software keyboard to open whenever `ime_allowed` is true.
+    pub(crate) struct WinitTextInputView;
+
+    unsafe impl ClassType for WinitTextInputView {
+        #[inherits(UIResponder, NSObject)]
+        type Super = UIView;
+        type Mutability = mutability::MainThreadOnly;
+        const NAME: &'static str = "WinitTextInputView";
+    }
+
+    impl DeclaredClass for WinitTextInputView {}
+
+    unsafe impl WinitTextInputView {
+        #[method(pointInside:withEvent:)]
+        fn point_inside(&self, _point: CGPoint, _event: Option<&UIEvent>) -> bool {
+            false
+        }
+
+        #[method(canBecomeFirstResponder)]
+        fn can_become_first_responder(&self) -> bool {
+            self.parent_view()
+                .is_some_and(|parent| parent.ivars().ime_allowed.get())
+        }
+
+        #[method(editingInteractionConfiguration)]
+        fn editing_interaction_configuration(&self) -> UIEditingInteractionConfiguration {
+            UIEditingInteractionConfiguration::None
+        }
+
+        #[method(resignFirstResponder)]
+        fn resign_first_responder(&self) -> bool {
+            if let Some(parent) = self.parent_view() {
+                if parent.ivars().ime_allowed.get() {
+                    parent.release_hardware_keys();
+                }
+            }
+            unsafe { msg_send![super(self), resignFirstResponder] }
+        }
+
+        #[method(pressesBegan:withEvent:)]
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            if !self
+                .parent_view()
+                .is_some_and(|p| p.handle_presses(presses, ElementState::Pressed))
+            {
+                let _: () = unsafe { msg_send![super(self), pressesBegan: presses withEvent: event] };
+            }
+        }
+
+        #[method(pressesEnded:withEvent:)]
+        fn presses_ended(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            if !self
+                .parent_view()
+                .is_some_and(|p| p.handle_presses(presses, ElementState::Released))
+            {
+                let _: () = unsafe { msg_send![super(self), pressesEnded: presses withEvent: event] };
+            }
+        }
+
+        #[method(pressesCancelled:withEvent:)]
+        fn presses_cancelled(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            if !self
+                .parent_view()
+                .is_some_and(|p| p.handle_presses(presses, ElementState::Released))
+            {
+                let _: () =
+                    unsafe { msg_send![super(self), pressesCancelled: presses withEvent: event] };
+            }
+        }
+    }
+
+    unsafe impl NSObjectProtocol for WinitTextInputView {}
+
+    unsafe impl UITextInputTraits for WinitTextInputView {}
+
+    unsafe impl UIKeyInput for WinitTextInputView {
+        #[method(hasText)]
+        fn has_text(&self) -> bool {
+            true
+        }
+
+        #[method(insertText:)]
+        fn insert_text(&self, text: &NSString) {
+            if let Some(parent) = self.parent_view() {
+                parent.handle_insert_text(text);
+            }
+        }
+
+        #[method(deleteBackward)]
+        fn delete_backward(&self) {
+            if let Some(parent) = self.parent_view() {
+                parent.handle_delete_backward();
+            }
+        }
+    }
+);
+
+impl WinitTextInputView {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let frame = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 1.0,
+                height: 1.0,
+            },
+        };
+        let this = mtm.alloc::<Self>().set_ivars(());
+        unsafe { msg_send_id![super(this), initWithFrame: frame] }
+    }
+
+    fn parent_view(&self) -> Option<Retained<WinitView>> {
+        let sv = self.superview()?;
+        if !sv.isKindOfClass(WinitView::class()) {
+            return None;
+        }
+        // SAFETY: `isKindOfClass` verified `sv` is a `WinitView`.
+        Some(unsafe { Retained::cast(sv) })
+    }
 }
 
 declare_class!(
@@ -321,22 +462,27 @@ declare_class!(
             app_state::handle_nonuser_event(mtm, gesture_event);
         }
 
-        // Remain a responder during gameplay while an empty input view hides the software keyboard.
-        #[method(inputView)]
-        fn input_view(&self) -> Option<&UIView> {
-            if self.ivars().ime_allowed.get() { None } else { Some(&*self.ivars().hidden_input) }
-        }
-
         #[method(didMoveToWindow)]
         fn did_move_to_window(&self) {
             let _: () = unsafe { msg_send![super(self), didMoveToWindow] };
-            if self.window().is_some() { unsafe { self.becomeFirstResponder(); } }
+            if let Some(window) = (**self).window() {
+                disable_system_gesture_delays(&window);
+                unsafe {
+                    if self.ivars().ime_allowed.get() {
+                        self.ivars().ime_view.becomeFirstResponder();
+                    } else {
+                        self.becomeFirstResponder();
+                    }
+                }
+            }
         }
 
         #[method(resignFirstResponder)]
         fn resign_first_responder(&self) -> bool {
-            self.release_hardware_keys();
-            self.set_mouse_captured(false);
+            if !self.ivars().ime_allowed.get() {
+                self.release_hardware_keys();
+                self.set_mouse_captured(false);
+            }
             unsafe { msg_send![super(self), resignFirstResponder] }
         }
 
@@ -394,26 +540,6 @@ declare_class!(
             true
         }
     }
-
-    unsafe impl UITextInputTraits for WinitView {
-    }
-
-    unsafe impl UIKeyInput for WinitView {
-        #[method(hasText)]
-        fn has_text(&self) -> bool {
-            true
-        }
-
-        #[method(insertText:)]
-        fn insert_text(&self, text: &NSString) {
-            self.handle_insert_text(text)
-        }
-
-        #[method(deleteBackward)]
-        fn delete_backward(&self) {
-            self.handle_delete_backward()
-        }
-    }
 );
 
 impl WinitView {
@@ -422,6 +548,7 @@ impl WinitView {
         window_attributes: &WindowAttributes,
         frame: CGRect,
     ) -> Retained<Self> {
+        let ime_view = WinitTextInputView::new(mtm);
         let this = mtm.alloc().set_ivars(WinitViewState {
             pinch_gesture_recognizer: RefCell::new(None),
             doubletap_gesture_recognizer: RefCell::new(None),
@@ -432,11 +559,15 @@ impl WinitView {
             pinch_last_delta: Cell::new(0.0),
             pan_last_delta: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
             ime_allowed: Cell::new(false),
-            hidden_input: unsafe { UIView::new(mtm) },
+            ime_view: ime_view.clone(),
             held_keys: RefCell::new(HashMap::new()),
             mouse: super::hardware_mouse::Mouse::default(),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
+
+        unsafe {
+            this.addSubview(&ime_view);
+        }
 
         this.setMultipleTouchEnabled(true);
         let hover = unsafe {
@@ -669,8 +800,16 @@ impl WinitView {
     pub(crate) fn set_ime_allowed(&self, allowed: bool) {
         self.ivars().ime_allowed.set(allowed);
         unsafe {
-            self.reloadInputViews();
-            self.becomeFirstResponder();
+            if allowed {
+                self.ivars().ime_view.becomeFirstResponder();
+            } else {
+                if self.ivars().ime_view.isFirstResponder() {
+                    self.ivars().ime_view.resignFirstResponder();
+                }
+                if self.window().is_some() {
+                    self.becomeFirstResponder();
+                }
+            }
         }
     }
 

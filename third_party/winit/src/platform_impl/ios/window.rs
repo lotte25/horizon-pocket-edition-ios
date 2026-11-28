@@ -56,6 +56,7 @@ declare_class!(
                 }),
             );
             let _: () = unsafe { msg_send![super(self), becomeKeyWindow] };
+            super::view::disable_system_gesture_delays(self);
         }
 
         #[method(resignKeyWindow)]
