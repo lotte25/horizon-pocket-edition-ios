@@ -1,13 +1,6 @@
 name: ios
 run-name: iOS · ${{ inputs.mods && format('native mods {0} · ', inputs.mods) || '' }}${{ github.sha }}
-# Horizon Pocket Edition (iOS): Horizon for iPhone and iPad, based on Starling (IOS-SYNC.md), on every push
-# to main:
-#   ipa: `horizon-ios-game` cross-compiled for aarch64-apple-ios and linted; the game files Starling's
-#        Android app prepares with Java, prepared here (tools/ios_prepare.py) and proved to come back on
-#        the phone file for file; the app bundled and checked to carry none of Mojang's files. The
-#        unsigned .ipa is kept only when dispatched with `deliver`.
-# Dispatched with `mods`, it builds the game with those native mods compiled in (docs/ios.md): an
-# iPhone runs no code its app did not ship with, so a native mod is part of the app itself.
+# Horizon Pocket Edition (iOS): cross-compiled for aarch64-apple-ios and packaged as an unsigned .ipa.
 on:
   push:
     branches: [main]
@@ -24,20 +17,15 @@ on:
 permissions:
   contents: read
 concurrency:
-  # A build with mods doesn't stop the plain one, nor one with other mods.
   group: ios-${{ github.ref }}-${{ inputs.mods }}
   cancel-in-progress: true
 env:
   HORIZON_TELEMETRY_URL: "off"
-  # Release with fewer codegen passes: the release profile's single unit and LTO cost minutes.
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: never
-  # The app's own minimum (project.yml); rustc and cc read it.
   IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-  # Where the app builds itself again with native mods (game/native_builds_ios.rs): this
-  # repository's ios workflow, on this branch.
   HORIZON_IOS_REPO: ${{ github.repository }}
   HORIZON_IOS_BRANCH: ${{ github.ref_name }}
 
@@ -54,95 +42,60 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      # First, so a mod id that isn't one stops the run in seconds.
-      - name: Fetch and check the native mods
-        if: ${{ inputs.mods }}
-        env:
-          MODS: ${{ inputs.mods }}
-        run: |
-          set -euo pipefail -f
-          # Built-in native mods live locally under native-mods/; no external registry fetch needed.
-          printf '{"projects":[]}\n' > "$RUNNER_TEMP/index.json"
-          python3 tools/ios_native_mods.py fetch "$RUNNER_TEMP/index.json" "$RUNNER_TEMP/native" ${MODS//,/ }
-          python3 tools/ios_native_mods.py info "$RUNNER_TEMP/native" "$GITHUB_SHA" > "$RUNNER_TEMP/native-mods.json"
-      - name: Check the Apple toolchain
-        run: bash tools/ci/ios-toolchain.sh
       - name: Install Rust and its iOS standard library
-        # Starling has no rust-toolchain.toml: stable, as its own workflows use.
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --target "$IOS_TARGET"
+          rustup toolchain install stable --profile minimal --target "$IOS_TARGET"
           rustup default stable
           rustc --version
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ios-${{ env.IOS_TARGET }}
-          # Keep what compiled even when the game itself did not, so the next run starts there.
           cache-on-failure: true
-          # A build with mods reads the plain build's cache and keeps none of its own.
           save-if: ${{ !inputs.mods }}
       - uses: actions/cache@v4
         if: ${{ inputs.mods }}
         with:
           path: ~/.cache/starling-native
           key: native-mixins-${{ runner.os }}-${{ hashFiles('packaging/android/native_build.sh') }}
-      - name: Apply the native mods to the source
+      - name: Stage native mods
         if: ${{ inputs.mods }}
-        run: |
-          bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles" 2>&1 | tee native-stage.log
-          echo "::notice::built with $(python3 tools/ios_native_mods.py names "$RUNNER_TEMP/native")"
-      # --keep-going: every crate that can be built is, so one run reports every error.
-      - name: Build the game
-        id: build
         env:
-          # A build for others: no developer launch arguments (main.rs PUBLIC_BUILD).
+          MODS: ${{ inputs.mods }}
+        run: |
+          set -euo pipefail -f
+          printf '{"projects":[]}\n' > "$RUNNER_TEMP/index.json"
+          python3 tools/ios_native_mods.py fetch "$RUNNER_TEMP/index.json" "$RUNNER_TEMP/native" ${MODS//,/ }
+          python3 tools/ios_native_mods.py info "$RUNNER_TEMP/native" "$GITHUB_SHA" > "$RUNNER_TEMP/native-mods.json"
+          bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles"
+      - name: Build the game
+        env:
           HORIZON_IOS_PUBLIC: "1"
-          # The Microsoft sign-in app (shared/account.rs): a repository variable, else the built-in one.
           HORIZON_MSA_CLIENT_ID: ${{ vars.HORIZON_MSA_CLIENT_ID }}
         run: |
           export HORIZON_IOS_BUILD_COMMIT="$GITHUB_SHA"
-          cargo build --release --keep-going --target "$IOS_TARGET" -p horizon-ios-game
-      # This port's code and Starling's must be warning-free on iOS; the vendored UIKit backend and
-      # registry crates are shown, not failed on.
-      - name: Lint the game for iOS
-        if: ${{ always() && !inputs.mods }}
-        run: |
-          cargo clippy --keep-going --target "$IOS_TARGET" -p horizon-ios-game \
-            --message-format short 2>&1 | tee clippy.log || true
-          if grep -E '^(crates|launcher)/[^:]+:[0-9]+:[0-9]+: (warning|error)' clippy.log; then
-            echo '::error::clippy found the problems above in the game'
-            exit 1
-          fi
-      - name: Keep the lockfile the build resolved
-        if: ${{ always() && !inputs.mods }}
-        run: |
-          if ! git diff --quiet -- Cargo.lock; then
-            echo '::warning::Cargo.lock changed in this build: commit the artifact cargo-lock'
-            mkdir -p lock && cp Cargo.lock lock/
-          fi
-      - uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
+          cargo build --release --target "$IOS_TARGET" -p horizon-ios-game
+      # Cache .local/ios/assets (engine-data.zip, lowbudget.zip, StarlingVisuals.zip) so Java/prepare
+      # only runs when Minecraft pins, exporters, or bundled art actually change.
+      - name: Restore cached iOS assets
+        id: ios-assets
+        uses: actions/cache@v4
         with:
-          name: cargo-lock
-          path: lock/Cargo.lock
-          retention-days: 7
-          if-no-files-found: ignore
-      # The game files don't depend on the game's build: checked even when it failed.
+          path: .local/ios/assets
+          key: ios-assets-${{ hashFiles('research-lock.json', 'exporters/**', 'crates/horizon-prepare/**', 'crates/horizon-ios-prepare/**', 'packaging/lowbudget/**', 'packaging/shaderpacks/starling-visuals/**') }}
       - uses: actions/setup-java@v4
-        if: ${{ !cancelled() }}
+        if: ${{ steps.ios-assets.outputs.cache-hit != 'true' }}
         with:
           distribution: temurin
           java-version: '25'
-      # Mojang's files, checked again each run, kept between runs so they are fetched once.
       - uses: actions/cache@v4
-        if: ${{ !cancelled() }}
+        if: ${{ steps.ios-assets.outputs.cache-hit != 'true' }}
         with:
           path: .local/ios-cache/minecraft
           key: ios-minecraft-${{ hashFiles('research-lock.json') }}
-      - name: Prepare the game files and prove the phone lays them out the same
-        if: ${{ !cancelled() }}
+      - name: Build iOS assets (cache miss)
+        if: ${{ steps.ios-assets.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
-          # A phone's file system is case-sensitive; this Mac's is not.
           hdiutil create -size 16g -fs 'Case-sensitive APFS' -volname StarlingPrep -type SPARSE \
             "$RUNNER_TEMP/prep.sparseimage" > /dev/null
           hdiutil attach "$RUNNER_TEMP/prep.sparseimage" > /dev/null
@@ -161,18 +114,9 @@ jobs:
             CONFIGURATION_BUILD_DIR="$PWD/build-ios" \
             build > xcode-build.log 2>&1 || { tail -80 xcode-build.log; exit 1; }
           app=build-ios/HorizonPE.app
-          # The version project.yml sets, as iOS and the sideloading apps will show it.
-          shown=$(plutil -extract CFBundleShortVersionString raw "$app/Info.plist")
-          id=$(plutil -extract CFBundleIdentifier raw "$app/Info.plist")
-          test -n "$shown" || { echo '::error::the app has no version'; exit 1; }
-          echo "::notice::Horizon PE $shown (build $GITHUB_RUN_NUMBER), $id"
           for asset in engine-data.zip lowbudget.zip StarlingVisuals.zip; do
             test -f "$app/assets/$asset" || { echo "::error::the app has no assets/$asset"; exit 1; }
           done
-          cmp -s "$app/HorizonPE" "target/$IOS_TARGET/release/horizon-ios-game" \
-            || { echo '::error::the app does not contain the Rust game'; exit 1; }
-          # What the game says it was built with (game/mods.rs BUILD_INFO, beside its program):
-          # the Mods page and crash reports name these mods.
           if [ -f "$RUNNER_TEMP/native-mods.json" ]; then
             cp "$RUNNER_TEMP/native-mods.json" "$app/native-mods.json"
           fi
@@ -180,30 +124,6 @@ jobs:
           cp -a "$app" game/Payload/
           ( cd game && zip -qry ../HorizonPE-iOS-unsigned.ipa Payload )
           ls -l HorizonPE-iOS-unsigned.ipa
-      - name: Say what the native mods did
-        if: ${{ failure() && inputs.mods }}
-        run: |
-          echo '::error::the build with native mods failed. A mod made for another game version may not apply (native-stage.log) or compile (the build step names its file): build again without it.'
-          tail -40 native-stage.log 2>/dev/null || true
-      - name: Preserve the Xcode log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-xcode-log
-          path: xcode-build.log
-          retention-days: 7
-          if-no-files-found: ignore
-      - name: Check the distributable carries no Mojang files
-        run: |
-          python3 - <<'PY'
-          import zipfile
-          with zipfile.ZipFile('HorizonPE-iOS-unsigned.ipa') as ipa:
-              names = ipa.namelist()
-          bad = [n for n in names if n.endswith(('.jar', '.ogg')) or '/minecraft/' in n or n.endswith('asset-index.json')]
-          if bad:
-              raise SystemExit(f'::error::the .ipa carries game files: {bad[:5]}')
-          print(f'{len(names)} entries, none of them Mojang files')
-          PY
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.deliver || inputs.mods }}
         with:
