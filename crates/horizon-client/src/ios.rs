@@ -152,9 +152,9 @@ pub fn ime_height() -> u32 {
     horizon_gamecontroller::keyboard_height()
 }
 
-fn heap_bytes() -> u64 {
-    horizon_gamecontroller::heap_in_use()
-        .saturating_add(horizon_threads::allocator_commit().0 as u64)
+fn heap_bytes() -> Option<u64> {
+    let system = horizon_gamecontroller::heap_in_use().unwrap_or(0);
+    Some(system.saturating_add(horizon_threads::allocator_commit().0 as u64))
 }
 
 /// Registers the platform's hooks and probes, before the game starts.
