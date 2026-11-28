@@ -9,8 +9,8 @@ use objc2_foundation::{
     CGFloat, CGPoint, CGRect, CGSize, MainThreadBound, MainThreadMarker, NSObjectProtocol,
 };
 use objc2_ui_kit::{
-    UIApplication, UICoordinateSpace, UIResponder, UIScreen, UIScreenOverscanCompensation,
-    UIViewController, UIWindow,
+    UIApplication, UICoordinateSpace, UIEditingInteractionConfiguration, UIEvent, UIEventType,
+    UIResponder, UIScreen, UIScreenOverscanCompensation, UIViewController, UIWindow,
 };
 use tracing::{debug, warn};
 
@@ -61,6 +61,9 @@ declare_class!(
 
         #[method(resignKeyWindow)]
         fn resign_key_window(&self) {
+            if let Some(view) = self.winit_view() {
+                view.cancel_all_direct_touches();
+            }
             let mtm = MainThreadMarker::new().unwrap();
             app_state::handle_nonuser_event(
                 mtm,
@@ -71,10 +74,38 @@ declare_class!(
             );
             let _: () = unsafe { msg_send![super(self), resignKeyWindow] };
         }
+
+        #[method(editingInteractionConfiguration)]
+        fn editing_interaction_configuration(&self) -> UIEditingInteractionConfiguration {
+            UIEditingInteractionConfiguration::None
+        }
+
+        #[method(sendEvent:)]
+        fn send_event(&self, event: &UIEvent) {
+            let is_touch = unsafe { event.r#type() } == UIEventType::Touches;
+            let winit_view = if is_touch { self.winit_view() } else { None };
+            if let Some(view) = &winit_view {
+                view.set_window_owns_direct_touches(true);
+            }
+            let _: () = unsafe { msg_send![super(self), sendEvent: event] };
+            if let Some(view) = &winit_view {
+                view.handle_window_touch_event(event);
+            }
+        }
     }
 );
 
 impl WinitUIWindow {
+    fn winit_view(&self) -> Option<Retained<WinitView>> {
+        let controller = self.rootViewController()?;
+        let view = unsafe { controller.viewIfLoaded() }?;
+        if view.isKindOfClass(WinitView::class()) {
+            // SAFETY: `isKindOfClass` verified `view` is a `WinitView`.
+            Some(unsafe { Retained::cast(view) })
+        } else {
+            None
+        }
+    }
     pub(crate) fn new(
         mtm: MainThreadMarker,
         window_attributes: &WindowAttributes,

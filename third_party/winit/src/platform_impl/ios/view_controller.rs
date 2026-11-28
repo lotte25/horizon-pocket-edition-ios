@@ -4,8 +4,8 @@ use objc2::rc::Retained;
 use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_foundation::{MainThreadMarker, NSObject};
 use objc2_ui_kit::{
-    UIDevice, UIInterfaceOrientationMask, UIRectEdge, UIResponder, UIStatusBarStyle,
-    UIUserInterfaceIdiom, UIView, UIViewController,
+    UIDevice, UIEditingInteractionConfiguration, UIInterfaceOrientationMask, UIRectEdge,
+    UIResponder, UIStatusBarStyle, UIUserInterfaceIdiom, UIView, UIViewController,
 };
 
 use super::app_state::{self};
@@ -87,6 +87,11 @@ declare_class!(
             self.ivars()
                 .preferred_screen_edges_deferring_system_gestures
                 .get()
+        }
+
+        #[method(editingInteractionConfiguration)]
+        fn editing_interaction_configuration(&self) -> UIEditingInteractionConfiguration {
+            UIEditingInteractionConfiguration::None
         }
     }
 );

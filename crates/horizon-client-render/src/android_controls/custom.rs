@@ -297,6 +297,10 @@ impl TouchControls {
         started: bool,
         ended: bool,
     ) -> bool {
+        if started && self.custom_fingers.contains_key(&id) {
+            // Recycled touch ID: cleanly release any stale custom button owned by this ID first.
+            let _ = self.custom_update(id, point, false, true);
+        }
         if let Some(key) = self.custom_fingers.get(&id).cloned() {
             if ended {
                 self.custom_fingers.remove(&id);

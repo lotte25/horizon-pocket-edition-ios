@@ -781,9 +781,6 @@ impl Game<'_> {
         }
         if self.classic_pe_active() {
             use horizon_client::classic_pe_touch::TouchPhaseKind;
-            if !self.captured && self.focused {
-                self.capture(true);
-            }
             let phase = match t.phase {
                 TouchPhase::Started => TouchPhaseKind::Started,
                 TouchPhase::Moved => TouchPhaseKind::Moved,
@@ -923,9 +920,6 @@ impl Game<'_> {
             self.selected = slot;
             self.mobile.controls.ignore(t.id);
             return;
-        }
-        if !self.captured && self.focused {
-            self.capture(true);
         }
         self.mobile.controls.projectile_crosshair = self
             .held()

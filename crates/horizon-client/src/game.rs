@@ -8034,9 +8034,9 @@ impl Game<'_> {
         );
         let scale = HudBatch::new(size).scale;
         let was_grabbed = self.captured;
-        // Android grabs the mouse as the activity's pointer capture, which comes a moment later
-        // (a loss the system makes comes back: game/input_mode.rs). Only a mouse player asks:
-        // a finger or a controller plays without it.
+        // Android and iOS grab the hardware pointer only while Keyboard & Mouse is the active
+        // input mode: touch and controller play never request pointer lock (which fails on every
+        // touch event on iPhone and locks the pointer on iPad during touch).
         #[cfg(target_os = "android")]
         {
             if capture {
@@ -8048,18 +8048,36 @@ impl Game<'_> {
                 crate::android::capture_pointer(self.captured);
             }
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            if capture {
+                self.mouse.set_ignore_first_move();
+            }
+            let want_grab =
+                capture && self.input_mode == horizon_client::input_mode::InputMode::KeyboardMouse;
+            if want_grab {
+                self.captured = window
+                    .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                    .is_ok();
+            } else {
+                if self.captured {
+                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                }
+                self.captured = false;
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let [vx, vy] = self.view_at.map(f64::from);
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let centre = winit::dpi::PhysicalPosition::new(
             vx + f64::from(size[0]) / 2.0,
             vy + f64::from(size[1]) / 2.0,
         );
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let warp = |window: &Window| {
             let _ = window.set_cursor_position(centre);
         };
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if self.options.offscreen && !self.split_window {
             // A genuinely hidden `--offscreen` run leaves the system pointer where
             // the person at the computer has it. Its grab is internal (an

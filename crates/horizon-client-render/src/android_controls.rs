@@ -1067,9 +1067,9 @@ impl TouchControls {
             return [0.0; 2];
         }
         if started {
-            // A new finger is never the one that was on the zoom button: the system gives a
-            // finger's number to the next one, and an end that wasn't heard would leave the
-            // zoom on under a finger that walks or looks.
+            // A new finger is never the one that was on the zoom button or a prior passthrough
+            // button: the system can reuse a touch ID, and a missed end must not leak old state.
+            self.passthrough_fingers.remove(&id);
             if self.zoom_finger.is_some_and(|(finger, _)| finger == id) {
                 self.zoom_finger = None;
             }
@@ -3849,5 +3849,37 @@ mod tests {
             moved.layouts[2][Control::Zoom as usize].center,
             [0.0225, 0.135]
         );
+    }
+
+    #[test]
+    fn three_finger_camera_attack_and_dpad_back_and_recycled_id_clears_passthrough() {
+        let mut c = TouchControls::default();
+        c.viewport(1920, 1080);
+        c.settings.mode = Mode::Dpad;
+        c.settings.split_controls = true;
+
+        // Finger 1: move camera.
+        c.update(1, [0.50, 0.45], true, false);
+        let d = c.update(1, [0.58, 0.48], false, false);
+        assert!(d[0] > 0.0);
+
+        // Finger 2: hold Attack.
+        let atk = c.placement(Control::Attack).center;
+        c.update(2, atk, true, false);
+
+        // Finger 3: press D-pad Down.
+        let mv = c.placement(Control::Move);
+        let back = [mv.center[0], mv.center[1] + mv.size * 0.35];
+        c.update(3, back, true, false);
+
+        let state = c.poll_state();
+        assert_eq!(state.triggers[1], 1.0);
+        assert!(state.left[1] < -0.5, "expected backward motion, got {:?}", state.left);
+
+        // Recycled ID 2 starting on Jump (non-passthrough) must not inherit Attack's passthrough.
+        let jump = c.placement(Control::Jump).center;
+        c.update(2, jump, true, false);
+        let jump_look = c.update(2, [jump[0] + 0.05, jump[1]], false, false);
+        assert_eq!(jump_look, [0.0, 0.0]);
     }
 }

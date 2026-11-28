@@ -27,6 +27,10 @@ const ZOOM_TAP_WINDOW: f64 = 0.25;
 const MARGIN: f32 = 12.0;
 /// How far above the hotbar its slots still accept a tap (thumbs land slightly high).
 const HOTBAR_REACH: f32 = 8.0;
+/// Outer hit-test forgiveness around the 3x3 D-pad (GUI pixels) when no other control was hit,
+/// so a thumb landing just below D-pad Down or beside an outer arrow still moves instead of
+/// falling through to camera look.
+const DPAD_TOUCH_SLOP: f32 = 6.0;
 
 /// `[x, y, width, height]` in GUI pixels.
 pub type Rect = [f32; 4];
@@ -811,7 +815,21 @@ impl ClassicPeTouches {
             }
             None => {
                 if let Some(bounds) = group_bounds(layout, LayoutGroup::Dpad)
-                    && let Some(mask) = dpad_sample(bounds, at)
+                    && let Some(mask) = dpad_sample(bounds, at).or_else(|| {
+                        let expanded = [
+                            bounds[0] - DPAD_TOUCH_SLOP,
+                            bounds[1] - DPAD_TOUCH_SLOP,
+                            bounds[2] + 2.0 * DPAD_TOUCH_SLOP,
+                            bounds[3] + 2.0 * DPAD_TOUCH_SLOP,
+                        ];
+                        contains(expanded, at).then(|| {
+                            let clamped = (
+                                at.0.clamp(bounds[0], bounds[0] + bounds[2] - 0.001),
+                                at.1.clamp(bounds[1], bounds[1] + bounds[3] - 0.001),
+                            );
+                            dpad_sample(bounds, clamped)
+                        })?
+                    })
                 {
                     emit_mask_diff(0, mask, &mut out);
                     let sprinting = self.check_double_tap_forward(mask, now);
@@ -2917,5 +2935,44 @@ mod tests {
         assert_eq!(t.dpad_mask(), DPAD_FORWARD);
         let _ = t.end(5);
         assert_eq!(t.dpad_mask(), DPAD_FORWARD);
+    }
+
+    #[test]
+    fn three_finger_camera_attack_and_dpad_back_with_edge_slop() {
+        let mut st = ClassicPeState::default();
+        st.config_loaded = true;
+        st.config.show_action_buttons = true;
+        let size = (640.0, 320.0);
+        let opts = LayoutOptions::default();
+        let home = std::path::Path::new(".");
+        let l = bedrock_layout(size.0, size.1, &st.config, opts);
+        let atk = center(&l, ClassicPeControl::LeftClick);
+        let back_rect = l
+            .iter()
+            .find_map(|(c, r)| (*c == ClassicPeControl::Back).then_some(*r))
+            .unwrap();
+        // Slightly below the bottom edge of Back (within DPAD_TOUCH_SLOP).
+        let back_edge = (
+            back_rect[0] + back_rect[2] * 0.5,
+            back_rect[1] + back_rect[3] + 3.0,
+        );
+
+        // Finger 1: drag camera on world.
+        st.touch_event(1, TouchPhaseKind::Started, (300.0, 120.0), size, opts, true, home);
+        let look_ev =
+            st.touch_event(1, TouchPhaseKind::Moved, (340.0, 130.0), size, opts, true, home);
+        assert!(look_ev.look_gui[0] > 0.0);
+
+        // Finger 2: hold Attack button.
+        st.touch_event(2, TouchPhaseKind::Started, atk, size, opts, true, home);
+
+        // Finger 3: press Back (even slightly below the lower border of the Back tile).
+        st.touch_event(3, TouchPhaseKind::Started, back_edge, size, opts, true, home);
+
+        let upd = st.frame_update(
+            size, 0.0, false, false, false, false, true, true, false, false, false, true,
+        );
+        assert_eq!(upd.pad.triggers[1], 1.0);
+        assert_eq!(upd.pad.left, [0.0, -1.0]);
     }
 }

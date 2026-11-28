@@ -513,6 +513,9 @@ impl Game<'_> {
     }
 
     pub(super) fn touch_size(&self) -> [u32; 2] {
+        if let Some(r) = self.renderer.as_ref() {
+            return [r.config.width.max(1), r.config.height.max(1)];
+        }
         self.window.as_ref().map_or([1, 1], |w| {
             let s = w.inner_size();
             [s.width.max(1), s.height.max(1)]

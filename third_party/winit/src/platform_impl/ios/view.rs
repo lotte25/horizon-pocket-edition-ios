@@ -9,11 +9,12 @@ use objc2_foundation::{
     CGFloat, CGPoint, CGRect, CGSize, MainThreadMarker, NSObject, NSSet, NSString,
 };
 use objc2_ui_kit::{
-    UICoordinateSpace, UIEditingInteractionConfiguration, UIEvent, UIForceTouchCapability,
-    UIGestureRecognizer, UIGestureRecognizerDelegate, UIGestureRecognizerState,
-    UIHoverGestureRecognizer, UIKeyInput, UIPanGestureRecognizer, UIPinchGestureRecognizer,
-    UIPress, UIPressesEvent, UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer,
-    UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView, UIWindow,
+    UICoordinateSpace, UIEditingInteractionConfiguration, UIEvent, UIEventType,
+    UIForceTouchCapability, UIGestureRecognizer, UIGestureRecognizerDelegate,
+    UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput, UIPanGestureRecognizer,
+    UIPinchGestureRecognizer, UIPress, UIPressesEvent, UIResponder, UIRotationGestureRecognizer,
+    UITapGestureRecognizer, UITextInputTraits, UITouch, UITouchPhase, UITouchType,
+    UITraitEnvironment, UIView, UIWindow,
 };
 
 use super::app_state::{self, EventWrapper};
@@ -41,21 +42,35 @@ pub struct WinitViewState {
     ime_view: Retained<WinitTextInputView>,
     held_keys: RefCell<HashMap<usize, KeyEvent>>,
     mouse: super::hardware_mouse::Mouse,
+    /// Active direct-touch IDs -> last physical position, reconciled directly from
+    /// `WinitUIWindow::sendEvent:` (or `UIEvent::touchesForView:` fallback) so system
+    /// gesture recognizers cannot delay, swallow, or falsely cancel multi-touch gameplay.
+    active_direct_touches: RefCell<HashMap<u64, PhysicalPosition<f64>>>,
+    window_owns_direct_touches: Cell<bool>,
 }
 
-/// Disable `delaysTouchesBegan` on UIKit's window-level `_UISystemGestureGateGestureRecognizer`
-/// instances so taps and 3rd-finger presses near the bottom edge (D-pad Down, hotbar) reach
-/// `touchesBegan:withEvent:` immediately instead of being delayed or swallowed.
-pub(crate) fn disable_system_gesture_delays(window: &UIWindow) {
-    if let Some(recognizers) = window.gestureRecognizers() {
+fn disable_recognizer_delays(view: &UIView) {
+    if let Some(recognizers) = view.gestureRecognizers() {
         for gr in recognizers.iter() {
-            if gr.class().name().contains("SystemGestureGate") {
+            let name = gr.class().name();
+            if name.contains("SystemGesture")
+                || name.contains("Editing")
+                || name.contains("Scribble")
+            {
                 unsafe {
                     gr.setDelaysTouchesBegan(false);
+                    gr.setDelaysTouchesEnded(false);
                 }
             }
         }
     }
+}
+
+/// Disable `delaysTouchesBegan` and `delaysTouchesEnded` on UIKit's window-level
+/// `_UISystemGestureGateGestureRecognizer` (and any system editing/scribble) instances so taps
+/// and 3rd-finger presses near the bottom edge (D-pad Down, hotbar) reach the game immediately.
+pub(crate) fn disable_system_gesture_delays(window: &UIWindow) {
+    disable_recognizer_delays(window);
 }
 
 declare_class!(
@@ -217,6 +232,7 @@ declare_class!(
             let _: () = unsafe { msg_send![super(self), layoutSubviews] };
 
             let window = self.window().unwrap();
+            self.disable_hierarchy_gesture_delays();
             let window_bounds = window.bounds();
             // If the app is started in landscape, the view frame and window bounds can be mismatched.
             // The view frame will be in portrait and the window bounds in landscape. So apply the
@@ -294,23 +310,23 @@ declare_class!(
         }
 
         #[method(touchesBegan:withEvent:)]
-        fn touches_began(&self, touches: &NSSet<UITouch>, _event: Option<&UIEvent>) {
-            self.handle_touches(touches)
+        fn touches_began(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            self.handle_touches(touches, event)
         }
 
         #[method(touchesMoved:withEvent:)]
-        fn touches_moved(&self, touches: &NSSet<UITouch>, _event: Option<&UIEvent>) {
-            self.handle_touches(touches)
+        fn touches_moved(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            self.handle_touches(touches, event)
         }
 
         #[method(touchesEnded:withEvent:)]
-        fn touches_ended(&self, touches: &NSSet<UITouch>, _event: Option<&UIEvent>) {
-            self.handle_touches(touches)
+        fn touches_ended(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            self.handle_touches(touches, event)
         }
 
         #[method(touchesCancelled:withEvent:)]
-        fn touches_cancelled(&self, touches: &NSSet<UITouch>, _event: Option<&UIEvent>) {
-            self.handle_touches(touches)
+        fn touches_cancelled(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            self.handle_touches(touches, event)
         }
 
         #[method(pinchGesture:)]
@@ -465,10 +481,15 @@ declare_class!(
         #[method(didMoveToWindow)]
         fn did_move_to_window(&self) {
             let _: () = unsafe { msg_send![super(self), didMoveToWindow] };
-            if let Some(window) = (**self).window() {
-                disable_system_gesture_delays(&window);
+            self.ivars().window_owns_direct_touches.set(false);
+            self.cancel_all_direct_touches();
+            if (**self).window().is_some() {
+                self.disable_hierarchy_gesture_delays();
                 unsafe {
                     if self.ivars().ime_allowed.get() {
+                        if self.ivars().ime_view.superview().is_none() {
+                            self.addSubview(&self.ivars().ime_view);
+                        }
                         self.ivars().ime_view.becomeFirstResponder();
                     } else {
                         self.becomeFirstResponder();
@@ -559,17 +580,18 @@ impl WinitView {
             pinch_last_delta: Cell::new(0.0),
             pan_last_delta: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
             ime_allowed: Cell::new(false),
-            ime_view: ime_view.clone(),
+            ime_view,
             held_keys: RefCell::new(HashMap::new()),
             mouse: super::hardware_mouse::Mouse::default(),
+            active_direct_touches: RefCell::new(HashMap::new()),
+            window_owns_direct_touches: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
-        unsafe {
-            this.addSubview(&ime_view);
-        }
-
         this.setMultipleTouchEnabled(true);
+        unsafe {
+            this.setExclusiveTouch(false);
+        }
         let hover = unsafe {
             UIHoverGestureRecognizer::initWithTarget_action(
                 mtm.alloc(),
@@ -689,64 +711,304 @@ impl WinitView {
         }
     }
 
-    fn handle_touches(&self, touches: &NSSet<UITouch>) {
-        let window = self.window().unwrap();
-        let mut touch_events = Vec::new();
-        let os_supports_force = app_state::os_capabilities().force_touch;
-        for touch in touches {
-            // Hover, direct touches and trackpad clicks share the render-view origin.
-            let logical_location = touch.locationInView(Some(self));
-            let touch_type = touch.r#type();
-            if touch_type == UITouchType::IndirectPointer && self.ivars().mouse.captured() {
-                continue;
-            }
-            let force = if os_supports_force {
-                let trait_collection = self.traitCollection();
-                let touch_capability = trait_collection.forceTouchCapability();
-                // Both the OS _and_ the device need to be checked for force touch support.
-                if touch_capability == UIForceTouchCapability::Available
-                    || touch_type == UITouchType::Pencil
-                {
-                    let force = touch.force();
-                    let max_possible_force = touch.maximumPossibleForce();
-                    let altitude_angle: Option<f64> = if touch_type == UITouchType::Pencil {
-                        let angle = touch.altitudeAngle();
-                        Some(angle as _)
-                    } else {
-                        None
-                    };
-                    Some(Force::Calibrated {
-                        force: force as _,
-                        max_possible_force: max_possible_force as _,
-                        altitude_angle,
-                    })
-                } else {
-                    None
-                }
+    fn disable_hierarchy_gesture_delays(&self) {
+        let mut current: Option<Retained<UIView>> = self.superview();
+        while let Some(view) = current {
+            disable_recognizer_delays(&view);
+            current = view.superview();
+        }
+        if let Some(window) = (**self).window() {
+            disable_system_gesture_delays(&window);
+        }
+    }
+
+    pub(crate) fn set_window_owns_direct_touches(&self, owned: bool) {
+        self.ivars().window_owns_direct_touches.set(owned);
+    }
+
+    pub(crate) fn cancel_all_direct_touches(&self) {
+        let cancelled: Vec<(u64, PhysicalPosition<f64>)> =
+            self.ivars().active_direct_touches.borrow_mut().drain().collect();
+        if cancelled.is_empty() {
+            return;
+        }
+        let Some(window) = self.window() else {
+            return;
+        };
+        let window_id = RootWindowId(window.id());
+        let events: Vec<EventWrapper> = cancelled
+            .into_iter()
+            .map(|(id, location)| {
+                EventWrapper::StaticEvent(Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::Touch(Touch {
+                        device_id: DEVICE_ID,
+                        id,
+                        location,
+                        force: None,
+                        phase: TouchPhase::Cancelled,
+                    }),
+                })
+            })
+            .collect();
+        let mtm = MainThreadMarker::new().unwrap();
+        app_state::handle_nonuser_events(mtm, events);
+    }
+
+    fn touch_force(&self, touch: &UITouch, touch_type: UITouchType, os_supports_force: bool) -> Option<Force> {
+        if !os_supports_force {
+            return None;
+        }
+        let trait_collection = self.traitCollection();
+        let touch_capability = trait_collection.forceTouchCapability();
+        // Both the OS _and_ the device need to be checked for force touch support.
+        if touch_capability == UIForceTouchCapability::Available
+            || touch_type == UITouchType::Pencil
+        {
+            let force = touch.force();
+            let max_possible_force = touch.maximumPossibleForce();
+            let altitude_angle: Option<f64> = if touch_type == UITouchType::Pencil {
+                let angle = touch.altitudeAngle();
+                Some(angle as _)
             } else {
                 None
             };
-            let touch_id = touch as *const UITouch as u64;
-            let phase = touch.phase();
-            let phase = match phase {
-                UITouchPhase::Began => TouchPhase::Started,
-                UITouchPhase::Moved => TouchPhase::Moved,
-                // 2 is UITouchPhase::Stationary and is not expected here
-                UITouchPhase::Ended => TouchPhase::Ended,
-                UITouchPhase::Cancelled => TouchPhase::Cancelled,
-                _ => panic!("unexpected touch phase: {phase:?}"),
-            };
+            Some(Force::Calibrated {
+                force: force as _,
+                max_possible_force: max_possible_force as _,
+                altitude_angle,
+            })
+        } else {
+            None
+        }
+    }
 
-            let physical_location = {
-                let scale_factor = self.contentScaleFactor();
-                PhysicalPosition::from_logical::<(f64, f64), f64>(
-                    (logical_location.x as _, logical_location.y as _),
-                    scale_factor as f64,
-                )
-            };
+    fn touch_physical_location(&self, touch: &UITouch) -> PhysicalPosition<f64> {
+        // Hover, direct touches and trackpad clicks share the render-view origin.
+        let logical_location = touch.locationInView(Some(self));
+        let scale_factor = self.contentScaleFactor();
+        PhysicalPosition::from_logical::<(f64, f64), f64>(
+            (logical_location.x as _, logical_location.y as _),
+            scale_factor as f64,
+        )
+    }
+
+    /// Reconcile direct touches directly from `UIEvent` (called by `WinitUIWindow::sendEvent:`
+    /// immediately after `[super sendEvent:]` has hit-tested `touch.view`). This delivers 3+
+    /// finger and edge touches without waiting for or getting cancelled by window-level
+    /// `UIGestureRecognizer`s (such as `_UISystemGestureGateGestureRecognizer` or 3-finger
+    /// editing recognizers), while ignoring touches that hit modal sheets, pickers, or IME UI.
+    pub(crate) fn handle_window_touch_event(&self, event: &UIEvent) {
+        if unsafe { event.r#type() } != UIEventType::Touches {
+            return;
+        }
+        let Some(window) = self.window() else {
+            return;
+        };
+        let window_id = RootWindowId(window.id());
+        let os_supports_force = app_state::os_capabilities().force_touch;
+        let mut touch_events = Vec::new();
+        let mut seen_in_event = Vec::new();
+
+        {
+            let mut active = self.ivars().active_direct_touches.borrow_mut();
+
+            if let Some(view_touches) = unsafe { event.touchesForView(self) } {
+                for touch in view_touches.iter() {
+                    let touch_type = touch.r#type();
+                    if touch_type == UITouchType::IndirectPointer {
+                        continue;
+                    }
+                    let touch_id = touch as *const UITouch as u64;
+                    let phase = touch.phase();
+                    let physical_location = self.touch_physical_location(touch);
+                    let force = self.touch_force(touch, touch_type, os_supports_force);
+
+                    match phase {
+                        UITouchPhase::Began => {
+                            seen_in_event.push(touch_id);
+                            if active.insert(touch_id, physical_location).is_none() {
+                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                                    window_id,
+                                    event: WindowEvent::Touch(Touch {
+                                        device_id: DEVICE_ID,
+                                        id: touch_id,
+                                        location: physical_location,
+                                        force,
+                                        phase: TouchPhase::Started,
+                                    }),
+                                }));
+                            }
+                        }
+                        UITouchPhase::Moved => {
+                            seen_in_event.push(touch_id);
+                            let out_phase = if active.insert(touch_id, physical_location).is_none() {
+                                TouchPhase::Started
+                            } else {
+                                TouchPhase::Moved
+                            };
+                            touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                                window_id,
+                                event: WindowEvent::Touch(Touch {
+                                    device_id: DEVICE_ID,
+                                    id: touch_id,
+                                    location: physical_location,
+                                    force,
+                                    phase: out_phase,
+                                }),
+                            }));
+                        }
+                        UITouchPhase::Stationary => {
+                            seen_in_event.push(touch_id);
+                            if active.insert(touch_id, physical_location).is_none() {
+                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                                    window_id,
+                                    event: WindowEvent::Touch(Touch {
+                                        device_id: DEVICE_ID,
+                                        id: touch_id,
+                                        location: physical_location,
+                                        force,
+                                        phase: TouchPhase::Started,
+                                    }),
+                                }));
+                            }
+                        }
+                        UITouchPhase::Ended => {
+                            if active.remove(&touch_id).is_some() {
+                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                                    window_id,
+                                    event: WindowEvent::Touch(Touch {
+                                        device_id: DEVICE_ID,
+                                        id: touch_id,
+                                        location: physical_location,
+                                        force,
+                                        phase: TouchPhase::Ended,
+                                    }),
+                                }));
+                            }
+                        }
+                        UITouchPhase::Cancelled => {
+                            if active.remove(&touch_id).is_some() {
+                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                                    window_id,
+                                    event: WindowEvent::Touch(Touch {
+                                        device_id: DEVICE_ID,
+                                        id: touch_id,
+                                        location: physical_location,
+                                        force,
+                                        phase: TouchPhase::Cancelled,
+                                    }),
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Reconcile against `event.allTouches()` so any tracked touch that ended/cancelled
+            // or disappeared from UIKit without appearing in `touchesForView:` never sticks.
+            if !active.is_empty() {
+                if let Some(all_touches) = unsafe { event.allTouches() } {
+                    for touch in all_touches.iter() {
+                        let touch_id = touch as *const UITouch as u64;
+                        if !active.contains_key(&touch_id) {
+                            continue;
+                        }
+                        match touch.phase() {
+                            UITouchPhase::Ended => {
+                                if active.remove(&touch_id).is_some() {
+                                    let loc = self.touch_physical_location(touch);
+                                    touch_events.push(EventWrapper::StaticEvent(
+                                        Event::WindowEvent {
+                                            window_id,
+                                            event: WindowEvent::Touch(Touch {
+                                                device_id: DEVICE_ID,
+                                                id: touch_id,
+                                                location: loc,
+                                                force: None,
+                                                phase: TouchPhase::Ended,
+                                            }),
+                                        },
+                                    ));
+                                }
+                            }
+                            UITouchPhase::Cancelled => {
+                                if active.remove(&touch_id).is_some() {
+                                    let loc = self.touch_physical_location(touch);
+                                    touch_events.push(EventWrapper::StaticEvent(
+                                        Event::WindowEvent {
+                                            window_id,
+                                            event: WindowEvent::Touch(Touch {
+                                                device_id: DEVICE_ID,
+                                                id: touch_id,
+                                                location: loc,
+                                                force: None,
+                                                phase: TouchPhase::Cancelled,
+                                            }),
+                                        },
+                                    ));
+                                }
+                            }
+                            _ => {
+                                seen_in_event.push(touch_id);
+                            }
+                        }
+                    }
+                }
+
+                let missing: Vec<(u64, PhysicalPosition<f64>)> = active
+                    .iter()
+                    .filter(|(id, _)| !seen_in_event.contains(id))
+                    .map(|(&id, &pos)| (id, pos))
+                    .collect();
+                for (id, location) in missing {
+                    active.remove(&id);
+                    touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::Touch(Touch {
+                            device_id: DEVICE_ID,
+                            id,
+                            location,
+                            force: None,
+                            phase: TouchPhase::Cancelled,
+                        }),
+                    }));
+                }
+            }
+        }
+
+        if !touch_events.is_empty() {
+            let mtm = MainThreadMarker::new().unwrap();
+            app_state::handle_nonuser_events(mtm, touch_events);
+        }
+    }
+
+    fn handle_touches(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let window_id = RootWindowId(window.id());
+        let window_owns_direct = self.ivars().window_owns_direct_touches.get();
+        let mut touch_events = Vec::new();
+        let os_supports_force = app_state::os_capabilities().force_touch;
+
+        for touch in touches {
+            let touch_type = touch.r#type();
             if touch_type == UITouchType::IndirectPointer {
+                if self.ivars().mouse.captured() {
+                    continue;
+                }
+                let phase = match touch.phase() {
+                    UITouchPhase::Began => TouchPhase::Started,
+                    UITouchPhase::Moved => TouchPhase::Moved,
+                    UITouchPhase::Ended => TouchPhase::Ended,
+                    UITouchPhase::Cancelled => TouchPhase::Cancelled,
+                    _ => continue,
+                };
+                let physical_location = self.touch_physical_location(touch);
                 touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                    window_id: RootWindowId(window.id()),
+                    window_id,
                     event: WindowEvent::CursorMoved {
                         device_id: DEVICE_ID,
                         position: physical_location,
@@ -757,7 +1019,7 @@ impl WinitView {
                     TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled
                 ) {
                     touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                        window_id: RootWindowId(window.id()),
+                        window_id,
                         event: WindowEvent::MouseInput {
                             device_id: DEVICE_ID,
                             button: crate::event::MouseButton::Left,
@@ -771,8 +1033,44 @@ impl WinitView {
                 }
                 continue;
             }
+            if window_owns_direct {
+                // `WinitUIWindow::sendEvent:` owns direct touches for this window.
+                continue;
+            }
+            let touch_id = touch as *const UITouch as u64;
+            let physical_location = self.touch_physical_location(touch);
+            let force = self.touch_force(touch, touch_type, os_supports_force);
+            let mut active = self.ivars().active_direct_touches.borrow_mut();
+            let phase = match touch.phase() {
+                UITouchPhase::Began => {
+                    if active.insert(touch_id, physical_location).is_some() {
+                        continue;
+                    }
+                    TouchPhase::Started
+                }
+                UITouchPhase::Moved => {
+                    if active.insert(touch_id, physical_location).is_none() {
+                        TouchPhase::Started
+                    } else {
+                        TouchPhase::Moved
+                    }
+                }
+                UITouchPhase::Ended => {
+                    if active.remove(&touch_id).is_none() {
+                        continue;
+                    }
+                    TouchPhase::Ended
+                }
+                UITouchPhase::Cancelled => {
+                    if active.remove(&touch_id).is_none() {
+                        continue;
+                    }
+                    TouchPhase::Cancelled
+                }
+                _ => continue,
+            };
             touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                window_id: RootWindowId(window.id()),
+                window_id,
                 event: WindowEvent::Touch(Touch {
                     device_id: DEVICE_ID,
                     id: touch_id,
@@ -782,8 +1080,49 @@ impl WinitView {
                 }),
             }));
         }
-        let mtm = MainThreadMarker::new().unwrap();
-        app_state::handle_nonuser_events(mtm, touch_events);
+
+        // Foreign-window fallback (e.g. a host container reparenting `WinitView` into its own
+        // `UIWindow`): also check `event.touchesForView(self)` for any newly begun direct touch
+        // currently being held back from `touchesBegan:` by a gesture recognizer.
+        if !window_owns_direct {
+            if let Some(event) = event {
+                if let Some(view_touches) = unsafe { event.touchesForView(self) } {
+                    let mut active = self.ivars().active_direct_touches.borrow_mut();
+                    for touch in view_touches.iter() {
+                        let touch_type = touch.r#type();
+                        if touch_type == UITouchType::IndirectPointer {
+                            continue;
+                        }
+                        if matches!(
+                            touch.phase(),
+                            UITouchPhase::Began | UITouchPhase::Moved | UITouchPhase::Stationary
+                        ) {
+                            let touch_id = touch as *const UITouch as u64;
+                            if !active.contains_key(&touch_id) {
+                                let physical_location = self.touch_physical_location(touch);
+                                let force = self.touch_force(touch, touch_type, os_supports_force);
+                                active.insert(touch_id, physical_location);
+                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                                    window_id,
+                                    event: WindowEvent::Touch(Touch {
+                                        device_id: DEVICE_ID,
+                                        id: touch_id,
+                                        location: physical_location,
+                                        force,
+                                        phase: TouchPhase::Started,
+                                    }),
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !touch_events.is_empty() {
+            let mtm = MainThreadMarker::new().unwrap();
+            app_state::handle_nonuser_events(mtm, touch_events);
+        }
     }
 
     pub(crate) fn set_mouse_captured(&self, captured: bool) {
@@ -801,10 +1140,16 @@ impl WinitView {
         self.ivars().ime_allowed.set(allowed);
         unsafe {
             if allowed {
+                if self.ivars().ime_view.superview().is_none() {
+                    self.addSubview(&self.ivars().ime_view);
+                }
                 self.ivars().ime_view.becomeFirstResponder();
             } else {
                 if self.ivars().ime_view.isFirstResponder() {
                     self.ivars().ime_view.resignFirstResponder();
+                }
+                if self.ivars().ime_view.superview().is_some() {
+                    self.ivars().ime_view.removeFromSuperview();
                 }
                 if self.window().is_some() {
                     self.becomeFirstResponder();
