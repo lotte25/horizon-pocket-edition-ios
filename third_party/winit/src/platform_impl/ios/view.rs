@@ -793,195 +793,168 @@ impl WinitView {
         )
     }
 
-    /// Reconcile direct touches directly from `UIEvent` (called by `WinitUIWindow::sendEvent:`
-    /// immediately after `[super sendEvent:]` has hit-tested `touch.view`). This delivers 3+
-    /// finger and edge touches without waiting for or getting cancelled by window-level
-    /// `UIGestureRecognizer`s (such as `_UISystemGestureGateGestureRecognizer` or 3-finger
-    /// editing recognizers), while ignoring touches that hit modal sheets, pickers, or IME UI.
-    pub(crate) fn handle_window_touch_event(&self, event: &UIEvent) {
+    fn touch_event(
+        window_id: RootWindowId,
+        id: u64,
+        location: PhysicalPosition<f64>,
+        force: Option<Force>,
+        phase: TouchPhase,
+    ) -> EventWrapper {
+        EventWrapper::StaticEvent(Event::WindowEvent {
+            window_id,
+            event: WindowEvent::Touch(Touch {
+                device_id: DEVICE_ID,
+                id,
+                location,
+                force,
+                phase,
+            }),
+        })
+    }
+
+    /// Snapshot direct touches from `UIEvent` *before* `[UIWindow sendEvent:]` mutates or clears
+    /// `UITouchPhase::Ended` / `Cancelled` state, while still respecting hit-testing so modal
+    /// sheets, pickers, alerts, other windows, and IME views keep their own touches.
+    /// The caller (`WinitUIWindow::sendEvent:`) dispatches the returned events *after* `[super
+    /// sendEvent:]` returns to avoid UIKit re-entrancy hazards.
+    pub(crate) fn collect_window_touch_events(
+        &self,
+        window: &WinitUIWindow,
+        event: &UIEvent,
+    ) -> Vec<EventWrapper> {
         if unsafe { event.r#type() } != UIEventType::Touches {
-            return;
+            return Vec::new();
         }
-        let Some(window) = self.window() else {
-            return;
+        let Some(all_touches) = (unsafe { event.allTouches() }) else {
+            return Vec::new();
         };
         let window_id = RootWindowId(window.id());
+        let window_ui: &UIWindow = window;
+        let window_view: &UIView = window_ui;
+        let self_view: &UIView = self;
         let os_supports_force = app_state::os_capabilities().force_touch;
         let mut touch_events = Vec::new();
-        let mut seen_in_event = Vec::new();
 
         {
             let mut active = self.ivars().active_direct_touches.borrow_mut();
-
-            if let Some(view_touches) = unsafe { event.touchesForView(self) } {
-                for touch in view_touches.iter() {
-                    let touch_type = touch.r#type();
-                    if touch_type == UITouchType::IndirectPointer {
-                        continue;
-                    }
-                    let touch_id = touch as *const UITouch as u64;
-                    let phase = touch.phase();
-                    let physical_location = self.touch_physical_location(touch);
-                    let force = self.touch_force(touch, touch_type, os_supports_force);
-
-                    match phase {
-                        UITouchPhase::Began => {
-                            seen_in_event.push(touch_id);
-                            if active.insert(touch_id, physical_location).is_none() {
-                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                                    window_id,
-                                    event: WindowEvent::Touch(Touch {
-                                        device_id: DEVICE_ID,
-                                        id: touch_id,
-                                        location: physical_location,
-                                        force,
-                                        phase: TouchPhase::Started,
-                                    }),
-                                }));
-                            }
-                        }
-                        UITouchPhase::Moved => {
-                            seen_in_event.push(touch_id);
-                            let out_phase = if active.insert(touch_id, physical_location).is_none() {
-                                TouchPhase::Started
-                            } else {
-                                TouchPhase::Moved
-                            };
-                            touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                                window_id,
-                                event: WindowEvent::Touch(Touch {
-                                    device_id: DEVICE_ID,
-                                    id: touch_id,
-                                    location: physical_location,
-                                    force,
-                                    phase: out_phase,
-                                }),
-                            }));
-                        }
-                        UITouchPhase::Stationary => {
-                            seen_in_event.push(touch_id);
-                            if active.insert(touch_id, physical_location).is_none() {
-                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                                    window_id,
-                                    event: WindowEvent::Touch(Touch {
-                                        device_id: DEVICE_ID,
-                                        id: touch_id,
-                                        location: physical_location,
-                                        force,
-                                        phase: TouchPhase::Started,
-                                    }),
-                                }));
-                            }
-                        }
-                        UITouchPhase::Ended => {
-                            if active.remove(&touch_id).is_some() {
-                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                                    window_id,
-                                    event: WindowEvent::Touch(Touch {
-                                        device_id: DEVICE_ID,
-                                        id: touch_id,
-                                        location: physical_location,
-                                        force,
-                                        phase: TouchPhase::Ended,
-                                    }),
-                                }));
-                            }
-                        }
-                        UITouchPhase::Cancelled => {
-                            if active.remove(&touch_id).is_some() {
-                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                                    window_id,
-                                    event: WindowEvent::Touch(Touch {
-                                        device_id: DEVICE_ID,
-                                        id: touch_id,
-                                        location: physical_location,
-                                        force,
-                                        phase: TouchPhase::Cancelled,
-                                    }),
-                                }));
-                            }
-                        }
-                        _ => {}
-                    }
+            for touch in all_touches.iter() {
+                let touch_type = touch.r#type();
+                if touch_type == UITouchType::IndirectPointer {
+                    continue;
                 }
-            }
+                let touch_id = touch as *const UITouch as u64;
+                let phase = touch.phase();
+                let already_active = active.contains_key(&touch_id);
+                let in_this_window = touch
+                    .window()
+                    .map_or(true, |w| std::ptr::eq(&*w, window_ui));
 
-            // Reconcile against `event.allTouches()` so any tracked touch that ended/cancelled
-            // or disappeared from UIKit without appearing in `touchesForView:` never sticks.
-            if !active.is_empty() {
-                if let Some(all_touches) = unsafe { event.allTouches() } {
-                    for touch in all_touches.iter() {
-                        let touch_id = touch as *const UITouch as u64;
-                        if !active.contains_key(&touch_id) {
+                match phase {
+                    UITouchPhase::Began => {
+                        if !in_this_window {
                             continue;
                         }
-                        match touch.phase() {
-                            UITouchPhase::Ended => {
-                                if active.remove(&touch_id).is_some() {
-                                    let loc = self.touch_physical_location(touch);
-                                    touch_events.push(EventWrapper::StaticEvent(
-                                        Event::WindowEvent {
-                                            window_id,
-                                            event: WindowEvent::Touch(Touch {
-                                                device_id: DEVICE_ID,
-                                                id: touch_id,
-                                                location: loc,
-                                                force: None,
-                                                phase: TouchPhase::Ended,
-                                            }),
-                                        },
-                                    ));
-                                }
+                        let hits_self = match touch.view() {
+                            Some(v) => std::ptr::eq(&*v, self_view),
+                            None => {
+                                let pt = touch.locationInView(Some(window_view));
+                                unsafe { window_view.hitTest_withEvent(pt, Some(event)) }
+                                    .is_some_and(|hit| std::ptr::eq(&*hit, self_view))
                             }
-                            UITouchPhase::Cancelled => {
-                                if active.remove(&touch_id).is_some() {
-                                    let loc = self.touch_physical_location(touch);
-                                    touch_events.push(EventWrapper::StaticEvent(
-                                        Event::WindowEvent {
-                                            window_id,
-                                            event: WindowEvent::Touch(Touch {
-                                                device_id: DEVICE_ID,
-                                                id: touch_id,
-                                                location: loc,
-                                                force: None,
-                                                phase: TouchPhase::Cancelled,
-                                            }),
-                                        },
-                                    ));
-                                }
-                            }
-                            _ => {
-                                seen_in_event.push(touch_id);
-                            }
+                        };
+                        if !hits_self {
+                            continue;
+                        }
+                        let physical_location = self.touch_physical_location(touch);
+                        let force = self.touch_force(touch, touch_type, os_supports_force);
+                        if let Some(stale_location) = active.insert(touch_id, physical_location) {
+                            touch_events.push(Self::touch_event(
+                                window_id,
+                                touch_id,
+                                stale_location,
+                                None,
+                                TouchPhase::Cancelled,
+                            ));
+                        }
+                        touch_events.push(Self::touch_event(
+                            window_id,
+                            touch_id,
+                            physical_location,
+                            force,
+                            TouchPhase::Started,
+                        ));
+                    }
+                    UITouchPhase::Moved => {
+                        if !already_active
+                            && !(in_this_window
+                                && touch.view().is_some_and(|v| std::ptr::eq(&*v, self_view)))
+                        {
+                            continue;
+                        }
+                        let physical_location = self.touch_physical_location(touch);
+                        let force = self.touch_force(touch, touch_type, os_supports_force);
+                        let out_phase = if active.insert(touch_id, physical_location).is_none() {
+                            TouchPhase::Started
+                        } else {
+                            TouchPhase::Moved
+                        };
+                        touch_events.push(Self::touch_event(
+                            window_id,
+                            touch_id,
+                            physical_location,
+                            force,
+                            out_phase,
+                        ));
+                    }
+                    UITouchPhase::Stationary => {
+                        if !already_active
+                            && in_this_window
+                            && touch.view().is_some_and(|v| std::ptr::eq(&*v, self_view))
+                        {
+                            let physical_location = self.touch_physical_location(touch);
+                            let force = self.touch_force(touch, touch_type, os_supports_force);
+                            active.insert(touch_id, physical_location);
+                            touch_events.push(Self::touch_event(
+                                window_id,
+                                touch_id,
+                                physical_location,
+                                force,
+                                TouchPhase::Started,
+                            ));
                         }
                     }
-                }
-
-                let missing: Vec<(u64, PhysicalPosition<f64>)> = active
-                    .iter()
-                    .filter(|(id, _)| !seen_in_event.contains(id))
-                    .map(|(&id, &pos)| (id, pos))
-                    .collect();
-                for (id, location) in missing {
-                    active.remove(&id);
-                    touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::Touch(Touch {
-                            device_id: DEVICE_ID,
-                            id,
-                            location,
-                            force: None,
-                            phase: TouchPhase::Cancelled,
-                        }),
-                    }));
+                    UITouchPhase::Ended => {
+                        if active.remove(&touch_id).is_some() {
+                            let physical_location = self.touch_physical_location(touch);
+                            let force = self.touch_force(touch, touch_type, os_supports_force);
+                            touch_events.push(Self::touch_event(
+                                window_id,
+                                touch_id,
+                                physical_location,
+                                force,
+                                TouchPhase::Ended,
+                            ));
+                        }
+                    }
+                    UITouchPhase::Cancelled => {
+                        if active.remove(&touch_id).is_some() {
+                            let physical_location = self.touch_physical_location(touch);
+                            let force = self.touch_force(touch, touch_type, os_supports_force);
+                            touch_events.push(Self::touch_event(
+                                window_id,
+                                touch_id,
+                                physical_location,
+                                force,
+                                TouchPhase::Cancelled,
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
 
-        if !touch_events.is_empty() {
-            let mtm = MainThreadMarker::new().unwrap();
-            app_state::handle_nonuser_events(mtm, touch_events);
-        }
+        touch_events
     }
 
     fn handle_touches(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
@@ -991,127 +964,220 @@ impl WinitView {
         let window_id = RootWindowId(window.id());
         let window_owns_direct = self.ivars().window_owns_direct_touches.get();
         let mut touch_events = Vec::new();
+        let mut handled_ids = Vec::new();
         let os_supports_force = app_state::os_capabilities().force_touch;
 
-        for touch in touches {
-            let touch_type = touch.r#type();
-            if touch_type == UITouchType::IndirectPointer {
-                if self.ivars().mouse.captured() {
-                    continue;
-                }
-                let phase = match touch.phase() {
-                    UITouchPhase::Began => TouchPhase::Started,
-                    UITouchPhase::Moved => TouchPhase::Moved,
-                    UITouchPhase::Ended => TouchPhase::Ended,
-                    UITouchPhase::Cancelled => TouchPhase::Cancelled,
-                    _ => continue,
-                };
-                let physical_location = self.touch_physical_location(touch);
-                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::CursorMoved {
-                        device_id: DEVICE_ID,
-                        position: physical_location,
-                    },
-                }));
-                if matches!(
-                    phase,
-                    TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled
-                ) {
+        {
+            let mut active = self.ivars().active_direct_touches.borrow_mut();
+
+            for touch in touches {
+                let touch_type = touch.r#type();
+                if touch_type == UITouchType::IndirectPointer {
+                    if self.ivars().mouse.captured() {
+                        continue;
+                    }
+                    let phase = match touch.phase() {
+                        UITouchPhase::Began => TouchPhase::Started,
+                        UITouchPhase::Moved => TouchPhase::Moved,
+                        UITouchPhase::Ended => TouchPhase::Ended,
+                        UITouchPhase::Cancelled => TouchPhase::Cancelled,
+                        _ => continue,
+                    };
+                    let physical_location = self.touch_physical_location(touch);
                     touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
                         window_id,
-                        event: WindowEvent::MouseInput {
+                        event: WindowEvent::CursorMoved {
                             device_id: DEVICE_ID,
-                            button: crate::event::MouseButton::Left,
-                            state: if phase == TouchPhase::Started {
-                                ElementState::Pressed
-                            } else {
-                                ElementState::Released
-                            },
+                            position: physical_location,
                         },
                     }));
-                }
-                continue;
-            }
-            if window_owns_direct {
-                // `WinitUIWindow::sendEvent:` owns direct touches for this window.
-                continue;
-            }
-            let touch_id = touch as *const UITouch as u64;
-            let physical_location = self.touch_physical_location(touch);
-            let force = self.touch_force(touch, touch_type, os_supports_force);
-            let mut active = self.ivars().active_direct_touches.borrow_mut();
-            let phase = match touch.phase() {
-                UITouchPhase::Began => {
-                    if active.insert(touch_id, physical_location).is_some() {
-                        continue;
+                    if matches!(
+                        phase,
+                        TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled
+                    ) {
+                        touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                            window_id,
+                            event: WindowEvent::MouseInput {
+                                device_id: DEVICE_ID,
+                                button: crate::event::MouseButton::Left,
+                                state: if phase == TouchPhase::Started {
+                                    ElementState::Pressed
+                                } else {
+                                    ElementState::Released
+                                },
+                            },
+                        }));
                     }
-                    TouchPhase::Started
+                    continue;
                 }
-                UITouchPhase::Moved => {
-                    if active.insert(touch_id, physical_location).is_none() {
-                        TouchPhase::Started
-                    } else {
-                        TouchPhase::Moved
-                    }
+                if window_owns_direct {
+                    // `WinitUIWindow::sendEvent:` owns direct touches for this window.
+                    continue;
                 }
-                UITouchPhase::Ended => {
-                    if active.remove(&touch_id).is_none() {
-                        continue;
-                    }
-                    TouchPhase::Ended
-                }
-                UITouchPhase::Cancelled => {
-                    if active.remove(&touch_id).is_none() {
-                        continue;
-                    }
-                    TouchPhase::Cancelled
-                }
-                _ => continue,
-            };
-            touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                window_id,
-                event: WindowEvent::Touch(Touch {
-                    device_id: DEVICE_ID,
-                    id: touch_id,
-                    location: physical_location,
-                    force,
-                    phase,
-                }),
-            }));
-        }
-
-        // Foreign-window fallback (e.g. a host container reparenting `WinitView` into its own
-        // `UIWindow`): also check `event.touchesForView(self)` for any newly begun direct touch
-        // currently being held back from `touchesBegan:` by a gesture recognizer.
-        if !window_owns_direct {
-            if let Some(event) = event {
-                if let Some(view_touches) = unsafe { event.touchesForView(self) } {
-                    let mut active = self.ivars().active_direct_touches.borrow_mut();
-                    for touch in view_touches.iter() {
-                        let touch_type = touch.r#type();
-                        if touch_type == UITouchType::IndirectPointer {
-                            continue;
+                let touch_id = touch as *const UITouch as u64;
+                handled_ids.push(touch_id);
+                let physical_location = self.touch_physical_location(touch);
+                let force = self.touch_force(touch, touch_type, os_supports_force);
+                match touch.phase() {
+                    UITouchPhase::Began => {
+                        if let Some(stale_location) = active.insert(touch_id, physical_location) {
+                            touch_events.push(Self::touch_event(
+                                window_id,
+                                touch_id,
+                                stale_location,
+                                None,
+                                TouchPhase::Cancelled,
+                            ));
                         }
-                        if matches!(
-                            touch.phase(),
-                            UITouchPhase::Began | UITouchPhase::Moved | UITouchPhase::Stationary
-                        ) {
+                        touch_events.push(Self::touch_event(
+                            window_id,
+                            touch_id,
+                            physical_location,
+                            force,
+                            TouchPhase::Started,
+                        ));
+                    }
+                    UITouchPhase::Moved => {
+                        let out_phase = if active.insert(touch_id, physical_location).is_none() {
+                            TouchPhase::Started
+                        } else {
+                            TouchPhase::Moved
+                        };
+                        touch_events.push(Self::touch_event(
+                            window_id,
+                            touch_id,
+                            physical_location,
+                            force,
+                            out_phase,
+                        ));
+                    }
+                    UITouchPhase::Ended => {
+                        if active.remove(&touch_id).is_some() {
+                            touch_events.push(Self::touch_event(
+                                window_id,
+                                touch_id,
+                                physical_location,
+                                force,
+                                TouchPhase::Ended,
+                            ));
+                        }
+                    }
+                    UITouchPhase::Cancelled => {
+                        if active.remove(&touch_id).is_some() {
+                            touch_events.push(Self::touch_event(
+                                window_id,
+                                touch_id,
+                                physical_location,
+                                force,
+                                TouchPhase::Cancelled,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Foreign-window fallback (e.g. a host container reparenting `WinitView` into its own
+            // `UIWindow`): also inspect `event.touchesForView(self)` for any direct touch held
+            // back from `touchesBegan:` / `touchesMoved:` / `touchesEnded:` by a recognizer.
+            if !window_owns_direct {
+                if let Some(event) = event {
+                    if let Some(view_touches) = unsafe { event.touchesForView(self) } {
+                        for touch in view_touches.iter() {
+                            let touch_type = touch.r#type();
+                            if touch_type == UITouchType::IndirectPointer {
+                                continue;
+                            }
                             let touch_id = touch as *const UITouch as u64;
-                            if !active.contains_key(&touch_id) {
-                                let physical_location = self.touch_physical_location(touch);
-                                let force = self.touch_force(touch, touch_type, os_supports_force);
-                                active.insert(touch_id, physical_location);
-                                touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                                    window_id,
-                                    event: WindowEvent::Touch(Touch {
-                                        device_id: DEVICE_ID,
-                                        id: touch_id,
-                                        location: physical_location,
+                            if handled_ids.contains(&touch_id) {
+                                continue;
+                            }
+                            match touch.phase() {
+                                UITouchPhase::Began => {
+                                    let physical_location = self.touch_physical_location(touch);
+                                    let force =
+                                        self.touch_force(touch, touch_type, os_supports_force);
+                                    if let Some(stale_location) =
+                                        active.insert(touch_id, physical_location)
+                                    {
+                                        touch_events.push(Self::touch_event(
+                                            window_id,
+                                            touch_id,
+                                            stale_location,
+                                            None,
+                                            TouchPhase::Cancelled,
+                                        ));
+                                    }
+                                    touch_events.push(Self::touch_event(
+                                        window_id,
+                                        touch_id,
+                                        physical_location,
                                         force,
-                                        phase: TouchPhase::Started,
-                                    }),
-                                }));
+                                        TouchPhase::Started,
+                                    ));
+                                }
+                                UITouchPhase::Moved => {
+                                    let physical_location = self.touch_physical_location(touch);
+                                    let force =
+                                        self.touch_force(touch, touch_type, os_supports_force);
+                                    let out_phase =
+                                        if active.insert(touch_id, physical_location).is_none() {
+                                            TouchPhase::Started
+                                        } else {
+                                            TouchPhase::Moved
+                                        };
+                                    touch_events.push(Self::touch_event(
+                                        window_id,
+                                        touch_id,
+                                        physical_location,
+                                        force,
+                                        out_phase,
+                                    ));
+                                }
+                                UITouchPhase::Stationary => {
+                                    if !active.contains_key(&touch_id) {
+                                        let physical_location = self.touch_physical_location(touch);
+                                        let force =
+                                            self.touch_force(touch, touch_type, os_supports_force);
+                                        active.insert(touch_id, physical_location);
+                                        touch_events.push(Self::touch_event(
+                                            window_id,
+                                            touch_id,
+                                            physical_location,
+                                            force,
+                                            TouchPhase::Started,
+                                        ));
+                                    }
+                                }
+                                UITouchPhase::Ended => {
+                                    if active.remove(&touch_id).is_some() {
+                                        let physical_location = self.touch_physical_location(touch);
+                                        let force =
+                                            self.touch_force(touch, touch_type, os_supports_force);
+                                        touch_events.push(Self::touch_event(
+                                            window_id,
+                                            touch_id,
+                                            physical_location,
+                                            force,
+                                            TouchPhase::Ended,
+                                        ));
+                                    }
+                                }
+                                UITouchPhase::Cancelled => {
+                                    if active.remove(&touch_id).is_some() {
+                                        let physical_location = self.touch_physical_location(touch);
+                                        let force =
+                                            self.touch_force(touch, touch_type, os_supports_force);
+                                        touch_events.push(Self::touch_event(
+                                            window_id,
+                                            touch_id,
+                                            physical_location,
+                                            force,
+                                            TouchPhase::Cancelled,
+                                        ));
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }

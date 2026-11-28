@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
-use objc2_foundation::{MainThreadMarker, NSObject};
+use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol};
 use objc2_ui_kit::{
     UIDevice, UIEditingInteractionConfiguration, UIInterfaceOrientationMask, UIRectEdge,
     UIResponder, UIStatusBarStyle, UIUserInterfaceIdiom, UIView, UIViewController,
@@ -55,6 +55,18 @@ declare_class!(
             if app_state::os_capabilities().defer_system_gestures {
                 self.setNeedsUpdateOfScreenEdgesDeferringSystemGestures();
             }
+        }
+
+        #[method(viewWillDisappear:)]
+        fn view_will_disappear(&self, animated: bool) {
+            if let Some(view) = unsafe { self.viewIfLoaded() } {
+                if view.isKindOfClass(super::view::WinitView::class()) {
+                    // SAFETY: `isKindOfClass` verified `view` is a `WinitView`.
+                    let view: Retained<super::view::WinitView> = unsafe { Retained::cast(view) };
+                    view.cancel_all_direct_touches();
+                }
+            }
+            let _: () = unsafe { msg_send![super(self), viewWillDisappear: animated] };
         }
 
         #[method(shouldAutorotate)]

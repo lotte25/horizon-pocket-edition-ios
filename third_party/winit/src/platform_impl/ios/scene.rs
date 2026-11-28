@@ -71,6 +71,11 @@ fn windows(scene: &UIWindowScene, focused: Option<bool>, occluded: Option<bool>)
             if !window.isKindOfClass(WinitUIWindow::class()) {
                 return None;
             }
+            if focused == Some(false) {
+                // SAFETY: `isKindOfClass` above verified `window` is a `WinitUIWindow`.
+                let winit_window = unsafe { &*(window as *const _ as *const WinitUIWindow) };
+                winit_window.cancel_direct_touches();
+            }
             let id = WindowId(super::window::WindowId::from(
                 window as *const _ as usize as u64,
             ));

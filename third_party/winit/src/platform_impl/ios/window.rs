@@ -61,9 +61,7 @@ declare_class!(
 
         #[method(resignKeyWindow)]
         fn resign_key_window(&self) {
-            if let Some(view) = self.winit_view() {
-                view.cancel_all_direct_touches();
-            }
+            self.cancel_direct_touches();
             let mtm = MainThreadMarker::new().unwrap();
             app_state::handle_nonuser_event(
                 mtm,
@@ -83,13 +81,20 @@ declare_class!(
         #[method(sendEvent:)]
         fn send_event(&self, event: &UIEvent) {
             let is_touch = unsafe { event.r#type() } == UIEventType::Touches;
-            let winit_view = if is_touch { self.winit_view() } else { None };
-            if let Some(view) = &winit_view {
-                view.set_window_owns_direct_touches(true);
-            }
+            let queued = if is_touch {
+                if let Some(view) = self.winit_view() {
+                    view.set_window_owns_direct_touches(true);
+                    view.collect_window_touch_events(self, event)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             let _: () = unsafe { msg_send![super(self), sendEvent: event] };
-            if let Some(view) = &winit_view {
-                view.handle_window_touch_event(event);
+            if !queued.is_empty() {
+                let mtm = MainThreadMarker::new().unwrap();
+                app_state::handle_nonuser_events(mtm, queued);
             }
         }
     }
@@ -104,6 +109,12 @@ impl WinitUIWindow {
             Some(unsafe { Retained::cast(view) })
         } else {
             None
+        }
+    }
+
+    pub(crate) fn cancel_direct_touches(&self) {
+        if let Some(view) = self.winit_view() {
+            view.cancel_all_direct_touches();
         }
     }
     pub(crate) fn new(
