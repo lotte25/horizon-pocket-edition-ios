@@ -19,12 +19,12 @@ on:
         type: string
         default: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud worldmap zoom"
       profile:
-        description: "Cargo profile (fast = Starling release default; release = full thin-LTO)"
+        description: "Cargo profile (release = Starling release default with thin-LTO; fast = quicker build without LTO)"
         type: choice
-        default: fast
+        default: release
         options:
-          - fast
           - release
+          - fast
       publish:
         description: "Create/update the GitHub Release for this version and attach Starling.apk"
         type: boolean
@@ -44,6 +44,8 @@ env:
   ANDROID_BUILD_TOOLS: "35.0.0"
   ANDROID_NDK_VERSION: "28.2.13676358"
   CARGO_INCREMENTAL: "0"
+  # Parallel ThinLTO codegen units so `release` builds stay fast and within runner RAM limits.
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   CARGO_TERM_COLOR: never
   DEFAULT_MODS: "appleskin armor_status biomecompass connected_textures coords_hud dynamiclights enchantmenthints jade rightharvest shulker_peek smartf3 status_effect_hud worldmap zoom"
 
@@ -133,7 +135,7 @@ jobs:
           bash packaging/ios/native_stage.sh . "$RUNNER_TEMP/native/bundles"
       - name: Build, pack, and sign Starling.apk
         env:
-          PROFILE: ${{ inputs.profile || 'fast' }}
+          PROFILE: ${{ inputs.profile || 'release' }}
           KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |

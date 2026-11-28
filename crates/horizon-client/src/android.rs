@@ -1015,10 +1015,12 @@ unsafe extern "C" {
     ) -> *mut std::ffi::c_void;
 }
 
-/// The native heap in use (the Stats overlay's `heap`).
+/// The native heap in use (the Stats overlay's `heap`): Bionic's `mallinfo` plus mimalloc's
+/// committed bytes when the Android cdylib uses `horizon_threads::Allocator`.
 fn heap_bytes() -> Option<u64> {
     // SAFETY: mallinfo takes nothing and returns a plain struct.
-    Some(unsafe { mallinfo() }.uordblks as u64)
+    let system = unsafe { mallinfo() }.uordblks as u64;
+    Some(system.saturating_add(horizon_threads::allocator_commit().0 as u64))
 }
 
 /// The NDK's thermal API (AThermal, Android 11; the headroom Android 12), looked up at run time

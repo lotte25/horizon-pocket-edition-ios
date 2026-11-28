@@ -178,17 +178,25 @@ const RESULTS_USAGE: wgpu::BufferUsages =
 const READBACK_USAGE: wgpu::BufferUsages =
     wgpu::BufferUsages::MAP_READ.union(wgpu::BufferUsages::COPY_DST);
 
+/// Qualcomm's PCI vendor id, which wgpu reports for Adreno GPUs.
+const ADRENO: u32 = 0x5143;
+
 impl Cull {
     /// The device feature culling needs, where the adapter has it.
     pub fn features(adapter: &wgpu::Adapter) -> wgpu::Features {
         adapter.features() & wgpu::Features::SHADER_EARLY_DEPTH_TEST
     }
     /// Where the device can run the test, if it can: Vulkan with early
-    /// depth tests, or Metal, both drawing an indirect multi-draw's entries
-    /// with the instance counts the GPU wrote, with fragment shaders that
-    /// write storage.
+    /// depth tests (Adreno's in the shader), or Metal, both drawing an
+    /// indirect multi-draw's entries with the instance counts the GPU wrote,
+    /// with fragment shaders that write storage.
     pub fn supported(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Option<DepthTest> {
-        let depth_test = match adapter.get_info().backend {
+        let info = adapter.get_info();
+        let depth_test = match info.backend {
+            // Adreno's Vulkan driver (e.g. Adreno 740, build 0676.41) now and then leaves
+            // sections out with the early test, the world flashing black or see-through as a
+            // block breaks; the test in the shader, as on Metal, holds.
+            wgpu::Backend::Vulkan if info.vendor == ADRENO => DepthTest::InShader,
             wgpu::Backend::Vulkan
                 if device
                     .features()

@@ -49,7 +49,7 @@ fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usi
 
 /// The machine's performance cores:
 /// - on Apple silicon (iOS / macOS) via `hw.perflevel0.physicalcpu`
-/// - on Linux by comparing max frequencies in `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`
+/// - on Linux / Android by comparing max frequencies in `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`
 #[cfg(target_vendor = "apple")]
 fn performance_cores() -> Option<usize> {
     let mut count: libc::c_int = 0;
@@ -67,31 +67,21 @@ fn performance_cores() -> Option<usize> {
     (read == 0 && count > 0).then_some(count as usize)
 }
 
-#[cfg(target_os = "linux")]
-fn performance_cores() -> Option<usize> {
-    let mut max_freq = 0u64;
-    let mut freqs = Vec::new();
-    let mut cpu_idx = 0;
-    loop {
-        let path = format!("/sys/devices/system/cpu/cpu{cpu_idx}/cpufreq/cpuinfo_max_freq");
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                if let Ok(freq) = content.trim().parse::<u64>() {
-                    max_freq = max_freq.max(freq);
-                    freqs.push(freq);
-                }
-                cpu_idx += 1;
-            }
-            Err(_) => break,
-        }
-    }
+/// Counts big/performance cores from per-CPU max frequencies (kHz).
+/// Returns `None` on homogeneous CPUs or when no frequency data is available.
+/// Uses the upper two-thirds of the `[min, max]` frequency span so Android tri-cluster
+/// SoCs (e.g. 1 Prime + 3/4 Performance + 3/4 Efficiency) include both Prime and
+/// Performance cores while excluding Efficiency cores.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn performance_cores_from_freqs(freqs: &[u64]) -> Option<usize> {
     if freqs.is_empty() {
         return None;
     }
     let min_freq = *freqs.iter().min()?;
+    let max_freq = *freqs.iter().max()?;
     if min_freq < max_freq {
-        let threshold = max_freq.saturating_sub(max_freq / 20);
-        let p_threads = freqs.iter().filter(|&&f| f >= threshold).count();
+        let threshold = min_freq + (max_freq - min_freq) / 3;
+        let p_threads = freqs.iter().filter(|&&f| f > threshold).count();
         if p_threads > 0 && p_threads < freqs.len() {
             return Some(p_threads);
         }
@@ -99,7 +89,26 @@ fn performance_cores() -> Option<usize> {
     None
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn performance_cores() -> Option<usize> {
+    let mut freqs = Vec::new();
+    let mut cpu_idx = 0;
+    loop {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu_idx}/cpufreq/cpuinfo_max_freq");
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                if let Ok(freq) = content.trim().parse::<u64>() {
+                    freqs.push(freq);
+                }
+                cpu_idx += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    performance_cores_from_freqs(&freqs)
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 fn performance_cores() -> Option<usize> {
     None
 }
@@ -701,6 +710,29 @@ mod tests {
         assert_eq!(super::workers_for(8, || None), 7);
         assert_eq!(super::workers_for(1, || None), 1);
         assert_eq!(super::workers_for(4, || Some(0)), 3);
+    }
+
+    #[test]
+    fn performance_cores_from_freqs_handles_android_and_desktop_topologies() {
+        // Snapdragon 8 Gen 2 (1 Prime + 4 Performance + 3 Efficiency): 5 big cores.
+        let sd8g2 = [
+            2_016_000, 2_016_000, 2_016_000, 2_803_200, 2_803_200, 2_803_200, 2_803_200, 3_187_200,
+        ];
+        assert_eq!(super::performance_cores_from_freqs(&sd8g2), Some(5));
+        // Mid-range Android 2+6 (2 big + 6 little): 2 big cores.
+        let mid = [
+            1_804_800, 1_804_800, 1_804_800, 1_804_800, 1_804_800, 1_804_800, 2_400_000, 2_400_000,
+        ];
+        assert_eq!(super::performance_cores_from_freqs(&mid), Some(2));
+        // Desktop hybrid P+E (e.g. 6P + 8E): 6 P-cores.
+        let hybrid = [
+            5_500_000, 5_500_000, 5_500_000, 5_500_000, 5_500_000, 5_500_000, 4_200_000, 4_200_000,
+            4_200_000, 4_200_000, 4_200_000, 4_200_000, 4_200_000, 4_200_000,
+        ];
+        assert_eq!(super::performance_cores_from_freqs(&hybrid), Some(6));
+        // Homogeneous CPU or empty slice returns None.
+        assert_eq!(super::performance_cores_from_freqs(&[3_600_000; 8]), None);
+        assert_eq!(super::performance_cores_from_freqs(&[]), None);
     }
 }
 

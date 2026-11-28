@@ -1400,6 +1400,7 @@ name = "horizon-android"
 version = "0.1.0"
 dependencies = [
  "horizon-client",
+ "horizon-threads",
  "jni 0.21.1",
  "winit",
 ]

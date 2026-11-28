@@ -5,6 +5,9 @@
 //! one calls `horizon_client::android`, where the game's Android hooks and its start-up are.
 #![cfg(target_os = "android")]
 
+#[global_allocator]
+static ALLOCATOR: horizon_threads::Allocator = horizon_threads::Allocator;
+
 use winit::platform::android::activity::AndroidApp;
 
 /// NativeActivity's entry point (the manifest's `android.app.func_name`): the game of this

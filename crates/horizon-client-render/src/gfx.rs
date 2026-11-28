@@ -4039,15 +4039,17 @@ impl Renderer {
                 let mut cull =
                     cull::Cull::new(&device, config.format.remove_srgb_suffix(), depth_test);
                 cull.always = cull_env.as_deref() == Ok("all");
-                if !cull.always && adapter_info.backend == wgpu::Backend::Metal {
+                if !cull.always
+                    && (adapter_info.backend == wgpu::Backend::Metal
+                        || adreno::adreno_vulkan(&adapter_info))
+                {
                     cull.min_sections = cull::TILED_MIN_SECTIONS;
                 }
                 cull
             });
-        // Android starts with it off (`section-cull on` or HORIZON_GPU_CULL=1 for A/B): on the
-        // tiled GPU measured (Adreno 740) it saved no GPU time, and a block the player placed or
-        // broke now and then left most of the terrain out of a frame, or a chunk out for longer.
-        let cull_on = cull.is_some() && (!cfg!(target_os = "android") || cull_env.is_ok());
+        // Adreno Vulkan now uses the in-shader depth test (`cull::Cull::supported`), avoiding
+        // the early-depth-test driver bug while gating tiled GPUs on `TILED_MIN_SECTIONS`.
+        let cull_on = cull.is_some();
         let depth = Self::depth(&device, &config);
         let world_post = world_post::Post::new(
             &device,

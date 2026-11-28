@@ -1033,11 +1033,13 @@ impl Graphics {
         // and render threads are raised above four cores, where vanilla
         // raises its server thread). Leaving two idled a core of a 4-thread
         // laptop while a world loaded: a teleport there took ~15% longer.
-        // On Apple silicon (iOS / macOS) `default_threads()` counts only P-cores
-        // (`hw.perflevel0.physicalcpu`) so chunk workers don't saturate E-cores and
-        // starve render/server threads. On Android leave two cores spare.
+        // On Apple silicon (iOS / macOS) and heterogeneous Linux / Android SoCs,
+        // `default_threads()` sizes workers to performance cores so background work
+        // doesn't spill onto efficiency cores and starve render/server threads. On Android,
+        // also keep at least two cores spare when sysfs frequency info is unavailable.
         let auto = if cfg!(target_os = "android") {
-            horizon_threads::worker_count().saturating_sub(2).max(1)
+            horizon_threads::jobs::default_threads()
+                .min(horizon_threads::worker_count().saturating_sub(2).max(1))
         } else {
             horizon_threads::jobs::default_threads()
         };
